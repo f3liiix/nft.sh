@@ -36,6 +36,15 @@ assert_file_not_contains() {
     fi
 }
 
+assert_file_absent() {
+    local file="$1" message="$2"
+    if [[ -e "$file" ]]; then
+        printf 'FAIL: %s\nunexpected file: %s\n' "$message" "$file" >&2
+        sed -n '1,220p' "$file" >&2 || true
+        exit 1
+    fi
+}
+
 assert_file_line_contains_all() {
     local file="$1" needle1="$2" needle2="$3" message="$4"
     if ! awk -v needle1="$needle1" -v needle2="$needle2" 'index($0, needle1) && index($0, needle2) { found=1; exit } END { exit found ? 0 : 1 }' "$file"; then
@@ -106,7 +115,11 @@ test_write_conf_file_uses_resolved_ip_and_keeps_domain_comment() (
 
 test_refresh_updates_domain_ip_and_preserves_rule_id() (
     setup_case
+    local open_port_calls=0
     RULES=('pf_10000_443_1710000000000000000|10000|example.com|93.184.216.34|443|0|domain rule')
+    firewall_open_port() {
+        open_port_calls=$((open_port_calls + 1))
+    }
     resolve_target_ipv4() {
         if [[ "$1" == "example.com" ]]; then
             printf '198.51.100.8\n'
@@ -117,6 +130,7 @@ test_refresh_updates_domain_ip_and_preserves_rule_id() (
     refresh_rule_resolved_ips
     assert_eq "1" "${DOMAIN_RESOLUTION_CHANGED}" "refresh should report a changed resolved IP"
     assert_eq 'pf_10000_443_1710000000000000000|10000|example.com|198.51.100.8|443|0|domain rule' "${RULES[0]}" "refresh should preserve rule_id and update resolved_ip"
+    assert_eq "0" "${open_port_calls}" "refresh should not open firewall ports directly"
 )
 
 test_refresh_keeps_previous_ip_on_resolution_failure() (
@@ -128,6 +142,28 @@ test_refresh_keeps_previous_ip_on_resolution_failure() (
     refresh_rule_resolved_ips
     assert_eq "0" "${DOMAIN_RESOLUTION_CHANGED}" "failed refresh should not report a change"
     assert_eq 'pf_10000_443_1710000000000000000|10000|example.com|93.184.216.34|443|0|domain rule' "${RULES[0]}" "failed refresh should preserve previous resolved_ip"
+)
+
+test_traffic_check_rolls_back_to_pre_load_rules_disk_state() (
+    setup_case
+    local legacy_conf='tcp dport 10000 dnat to 93.184.216.34:443'
+
+    printf '%s\n' "${legacy_conf}" > "${NFT_FORWARD_CONF_FILE}"
+
+    read_counter_bytes() {
+        return 1
+    }
+    write_conf_file() {
+        return 1
+    }
+
+    if traffic_check 1710000000; then
+        fail "traffic_check should fail when write_conf_file fails during counter repair"
+    fi
+
+    assert_eq "${legacy_conf}" "$(cat "${NFT_FORWARD_CONF_FILE}")" "rollback should preserve pre-load legacy conf content"
+    assert_file_absent "${NFT_FORWARD_RULES_FILE}" "rollback should delete migrated rules file when it did not exist before load_rules"
+    assert_file_absent "${NFT_FORWARD_STATE_FILE}" "rollback should delete migrated state file when it did not exist before load_rules"
 )
 
 test_timer_uses_two_minutes() (
@@ -142,6 +178,7 @@ main() {
     test_write_conf_file_uses_resolved_ip_and_keeps_domain_comment
     test_refresh_updates_domain_ip_and_preserves_rule_id
     test_refresh_keeps_previous_ip_on_resolution_failure
+    test_traffic_check_rolls_back_to_pre_load_rules_disk_state
     test_timer_uses_two_minutes
     printf 'All domain NAT tests passed\n'
 }

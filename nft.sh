@@ -3073,7 +3073,6 @@ refresh_rule_resolved_ips() {
         if [[ "$new_ip" != "$resolved_ip" ]]; then
             DOMAIN_RESOLUTION_CHANGED=1
             refreshed_rules+=("${rule_id}|${lport}|${target_host}|${new_ip}|${dport}|${quota_gb}|${remark}")
-            firewall_open_port "$lport" "$new_ip" "$dport"
             log_action "域名解析更新: ${target_host} ${resolved_ip} -> ${new_ip}"
         else
             refreshed_rules+=("$rule")
@@ -3092,11 +3091,6 @@ traffic_check() {
     local old_state_content="" old_conf_content="" old_rules_content="" had_state=0 had_conf=0 had_rules=0
     local -a OLD_RULES_SNAPSHOT=()
 
-    load_rules
-    OLD_RULES_SNAPSHOT=("${RULES[@]}")
-    ensure_state_for_rules
-    load_traffic_state
-
     if [[ -f "${STATE_FILE}" ]]; then
         old_state_content="$(cat "${STATE_FILE}")"
         had_state=1
@@ -3109,6 +3103,11 @@ traffic_check() {
         old_rules_content="$(cat "${RULES_FILE}")"
         had_rules=1
     fi
+
+    load_rules
+    OLD_RULES_SNAPSHOT=("${RULES[@]}")
+    ensure_state_for_rules
+    load_traffic_state
 
     for rule in "${RULES[@]}"; do
         IFS='|' read -r rule_id _ _ _ _ quota_gb _ <<< "$rule"
