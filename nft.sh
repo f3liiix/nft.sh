@@ -2734,7 +2734,7 @@ do_add() {
     local -a OLD_RULES_SNAPSHOT=("${RULES[@]}")
     local rule_id
     rule_id="$(make_rule_id "$lport" "$dip" "$dport")"
-    RULES+=("${rule_id}|${lport}|${dip}|${dport}|${quota_gb}|${remark}")
+    RULES+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|${quota_gb}|${remark}")
     if ! write_rules_file; then
         RULES=("${OLD_RULES_SNAPSHOT[@]}")
         return
