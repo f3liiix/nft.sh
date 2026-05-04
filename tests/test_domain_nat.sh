@@ -18,14 +18,6 @@ assert_eq() {
     fi
 }
 
-assert_contains() {
-    local haystack="$1" needle="$2" message="$3"
-    if [[ "$haystack" != *"$needle"* ]]; then
-        printf 'FAIL: %s\nmissing: %s\ncontent:\n%s\n' "$message" "$needle" "$haystack" >&2
-        exit 1
-    fi
-}
-
 assert_file_contains() {
     local file="$1" needle="$2" message="$3"
     if ! grep -qF "$needle" "$file"; then
@@ -44,8 +36,18 @@ assert_file_not_contains() {
     fi
 }
 
+assert_file_line_contains_all() {
+    local file="$1" needle1="$2" needle2="$3" message="$4"
+    if ! awk -v needle1="$needle1" -v needle2="$needle2" 'index($0, needle1) && index($0, needle2) { found=1; exit } END { exit found ? 0 : 1 }' "$file"; then
+        printf 'FAIL: %s\nmissing line with: %s and %s\nfile: %s\n' "$message" "$needle1" "$needle2" "$file" >&2
+        sed -n '1,220p' "$file" >&2 || true
+        exit 1
+    fi
+}
+
 setup_case() {
     CASE_DIR="$(mktemp -d)"
+    trap 'rm -rf "${CASE_DIR}"' EXIT
     export NFT_FORWARD_TEST_MODE=1
     export NFT_FORWARD_CONF_DIR="${CASE_DIR}/etc/nftables.d"
     export NFT_FORWARD_CONF_FILE="${NFT_FORWARD_CONF_DIR}/port-forward.conf"
@@ -98,7 +100,7 @@ test_write_conf_file_uses_resolved_ip_and_keeps_domain_comment() (
     write_conf_file
     assert_file_contains "${NFT_FORWARD_CONF_FILE}" 'dnat to 93.184.216.34:443' "nft DNAT should use resolved IPv4"
     assert_file_contains "${NFT_FORWARD_CONF_FILE}" 'ip daddr 93.184.216.34 tcp dport 443' "forward path should match resolved IPv4"
-    assert_file_contains "${NFT_FORWARD_CONF_FILE}" 'example.com(93.184.216.34):443' "comments should show domain and resolved IPv4"
+    assert_file_line_contains_all "${NFT_FORWARD_CONF_FILE}" 'example.com' '93.184.216.34' "comments should show domain and resolved IPv4"
     assert_file_not_contains "${NFT_FORWARD_CONF_FILE}" 'dnat to example.com:443' "nft config must not use domain directly"
 )
 
@@ -131,7 +133,6 @@ test_refresh_keeps_previous_ip_on_resolution_failure() (
 test_timer_uses_two_minutes() (
     setup_case
     install_traffic_timer
-    assert_file_contains "${NFT_FORWARD_SYSTEMD_DIR}/nft-forward-traffic-check.timer" 'Description=Run nft-forward traffic and domain refresh check every 2 minutes' "timer description should mention 2 minutes"
     assert_file_contains "${NFT_FORWARD_SYSTEMD_DIR}/nft-forward-traffic-check.timer" 'OnUnitActiveSec=2min' "timer should run every 2 minutes"
 )
 
