@@ -801,6 +801,48 @@ get_snat_ip_for_dest() {
     get_local_ip
 }
 
+resolve_target_ipv4() {
+    local target_host="$1" candidate line
+
+    if validate_ip "$target_host"; then
+        printf '%s\n' "$target_host"
+        return 0
+    fi
+
+    validate_domain_name "$target_host" || return 1
+
+    if command -v getent >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            candidate="${line%%[[:space:]]*}"
+            if validate_ip "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(getent ahostsv4 "$target_host" 2>/dev/null || true)
+    fi
+
+    if command -v dig >/dev/null 2>&1; then
+        while IFS= read -r candidate; do
+            if validate_ip "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(dig +short A "$target_host" 2>/dev/null || true)
+    fi
+
+    if command -v host >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            candidate="${line##* has address }"
+            if [[ "$candidate" != "$line" ]] && validate_ip "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(host "$target_host" 2>/dev/null || true)
+    fi
+
+    return 1
+}
+
 # ============== 发行版检测 ==============
 detect_pkg_manager() {
     if command -v apt-get &>/dev/null; then
@@ -1528,7 +1570,7 @@ migrate_legacy_rules_if_needed() {
             rule_id="$parsed"
             parsed="$(rule_fields_from_id "$rule_id")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
-            migrated+=("${rule_id}|${lport}|${dip}|${dport}|0|")
+            migrated+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|0|")
         fi
     done < "${CONF_FILE}"
 
@@ -1538,7 +1580,7 @@ migrate_legacy_rules_if_needed() {
             parsed="$(parse_dnat_rule_line "$line")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
             rule_id="$(make_legacy_rule_id "$lport" "$dip" "$dport")"
-            migrated+=("${rule_id}|${lport}|${dip}|${dport}|0|")
+            migrated+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|0|")
         done < "${CONF_FILE}"
     fi
 
@@ -1706,16 +1748,15 @@ write_conf_file() {
 
     # 先写入临时文件，成功后原子替换，避免写到一半断电导致配置损坏
     local tmp_file="${CONF_FILE}.tmp.$$"
-    local rule rule_id lport target_host resolved_ip dip dport quota_gb snat_ip
+    local rule rule_id lport target_host resolved_ip dport quota_gb snat_ip target_label
 
     for rule in "${RULES[@]}"; do
         IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
-        dip="$target_host"
         validate_rule_id "$rule_id" || continue
         is_rule_blocked "$rule_id" && continue
-        snat_ip="$(get_snat_ip_for_dest "$dip")"
+        snat_ip="$(get_snat_ip_for_dest "$resolved_ip")"
         if [[ -z "$snat_ip" ]]; then
-            err "无法获取到 ${dip} 的 SNAT 源地址，请检查路由配置。"
+            err "无法获取到 ${resolved_ip} 的 SNAT 源地址，请检查路由配置。"
             return 1
         fi
     done
@@ -1729,7 +1770,6 @@ EOF
 
         for rule in "${RULES[@]}"; do
             IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
-            dip="$target_host"
             validate_rule_id "$rule_id" || continue
             cat <<EOF
     counter ${rule_id}_egress {
@@ -1746,21 +1786,21 @@ EOF
 
         for rule in "${RULES[@]}"; do
             IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
-            dip="$target_host"
             validate_rule_id "$rule_id" || continue
+            target_label="$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
             if is_rule_blocked "$rule_id"; then
                 cat <<EOF
 
-        # 阻断: 本机:${lport} -> ${dip}:${dport}
+        # 阻断: 本机:${lport} -> ${target_label}
         fib daddr type local tcp dport ${lport} drop
         fib daddr type local udp dport ${lport} drop
 EOF
             else
                 cat <<EOF
 
-        # 转发: 本机:${lport} -> ${dip}:${dport}
-        fib daddr type local tcp dport ${lport} ct mark set ${lport} dnat to ${dip}:${dport}
-        fib daddr type local udp dport ${lport} ct mark set ${lport} dnat to ${dip}:${dport}
+        # 转发: 本机:${lport} -> ${target_label}
+        fib daddr type local tcp dport ${lport} ct mark set ${lport} dnat to ${resolved_ip}:${dport}
+        fib daddr type local udp dport ${lport} ct mark set ${lport} dnat to ${resolved_ip}:${dport}
 EOF
             fi
         done
@@ -1775,29 +1815,29 @@ EOF
 
         for rule in "${RULES[@]}"; do
             IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
-            dip="$target_host"
             validate_rule_id "$rule_id" || continue
+            target_label="$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
             if is_rule_blocked "$rule_id"; then
                 cat <<EOF
 
-        # 阻断请求: 客户端 -> ${dip}:${dport}
-        ct mark ${lport} ip daddr ${dip} tcp dport ${dport} drop
-        ct mark ${lport} ip daddr ${dip} udp dport ${dport} drop
+        # 阻断请求: 客户端 -> ${target_label}
+        ct mark ${lport} ip daddr ${resolved_ip} tcp dport ${dport} drop
+        ct mark ${lport} ip daddr ${resolved_ip} udp dport ${dport} drop
 
-        # 阻断回程: ${dip}:${dport} -> 客户端
-        ct mark ${lport} ip saddr ${dip} tcp sport ${dport} drop
-        ct mark ${lport} ip saddr ${dip} udp sport ${dport} drop
+        # 阻断回程: ${target_label} -> 客户端
+        ct mark ${lport} ip saddr ${resolved_ip} tcp sport ${dport} drop
+        ct mark ${lport} ip saddr ${resolved_ip} udp sport ${dport} drop
 EOF
             else
                 cat <<EOF
 
-        # 放行请求: 客户端 -> ${dip}:${dport}
-        ct mark ${lport} ip daddr ${dip} tcp dport ${dport} accept
-        ct mark ${lport} ip daddr ${dip} udp dport ${dport} accept
+        # 放行请求: 客户端 -> ${target_label}
+        ct mark ${lport} ip daddr ${resolved_ip} tcp dport ${dport} accept
+        ct mark ${lport} ip daddr ${resolved_ip} udp dport ${dport} accept
 
-        # 统计回程: ${dip}:${dport} -> 客户端
-        ct mark ${lport} ip saddr ${dip} tcp sport ${dport} counter name ${rule_id}_egress accept
-        ct mark ${lport} ip saddr ${dip} udp sport ${dport} counter name ${rule_id}_egress accept
+        # 统计回程: ${target_label} -> 客户端
+        ct mark ${lport} ip saddr ${resolved_ip} tcp sport ${dport} counter name ${rule_id}_egress accept
+        ct mark ${lport} ip saddr ${resolved_ip} udp sport ${dport} counter name ${rule_id}_egress accept
 EOF
             fi
         done
@@ -1812,17 +1852,17 @@ EOF
 
         for rule in "${RULES[@]}"; do
             IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
-            dip="$target_host"
             validate_rule_id "$rule_id" || continue
             if is_rule_blocked "$rule_id"; then
                 continue
             fi
-            snat_ip="$(get_snat_ip_for_dest "$dip")"
+            target_label="$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+            snat_ip="$(get_snat_ip_for_dest "$resolved_ip")"
             cat <<EOF
 
-        # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为到目标路由的源地址
-        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to ${snat_ip}
-        ip daddr ${dip} udp dport ${dport} ct status dnat snat to ${snat_ip}
+        # 回源: 发往 ${target_label} 的已 DNAT 流量, SNAT 为到目标路由的源地址
+        ip daddr ${resolved_ip} tcp dport ${dport} ct status dnat snat to ${snat_ip}
+        ip daddr ${resolved_ip} udp dport ${dport} ct status dnat snat to ${snat_ip}
 EOF
         done
 
@@ -2667,17 +2707,21 @@ do_add() {
         return
     fi
 
-    # 输入目标 IP
-    local dip
+    # 输入目标地址并解析 IPv4
+    local target_host resolved_ip
     while true; do
-        if ! dip="$(ui_input "请输入目标 IP 地址:" "" "例如 192.168.1.100")"; then
+        if ! target_host="$(ui_input "请输入目标 IP 或域名:" "" "例如 192.168.1.100 或 example.com")"; then
             info "已取消。"
             return
         fi
-        if validate_ip "$dip"; then
+        if ! validate_target_host "$target_host"; then
+            err "目标地址无效，请输入合法 IPv4 或域名。"
+            continue
+        fi
+        if resolved_ip="$(resolve_target_ipv4 "$target_host")"; then
             break
         fi
-        err "IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
+        err "无法解析 ${target_host} 的 IPv4 地址，请检查域名或 DNS。"
     done
 
     # 输入目标端口
@@ -2720,7 +2764,10 @@ do_add() {
         echo ""
     fi
     echo "即将添加转发规则:"
-    echo " - 本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo " - 本机端口 ${lport} (tcp+udp) -> ${target_host}:${dport}"
+    if [[ "$target_host" != "$resolved_ip" ]]; then
+        echo " - 当前解析 IP: ${resolved_ip}"
+    fi
     echo " - 月流量上限: $(format_quota "$quota_gb")"
     echo " - 备注: $(format_remark "$remark")"
     echo ""
@@ -2733,8 +2780,8 @@ do_add() {
     backup_conf
     local -a OLD_RULES_SNAPSHOT=("${RULES[@]}")
     local rule_id
-    rule_id="$(make_rule_id "$lport" "$dip" "$dport")"
-    RULES+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|${quota_gb}|${remark}")
+    rule_id="$(make_rule_id "$lport" "$target_host" "$dport")"
+    RULES+=("${rule_id}|${lport}|${target_host}|${resolved_ip}|${dport}|${quota_gb}|${remark}")
     if ! write_rules_file; then
         RULES=("${OLD_RULES_SNAPSHOT[@]}")
         return
@@ -2750,9 +2797,9 @@ do_add() {
         return
     fi
 
-    firewall_open_port "$lport" "$dip" "$dport"
-    info "转发规则添加成功: ${lport} → ${dip}:${dport}"
-    log_action "新增转发: ${lport} -> ${dip}:${dport}"
+    firewall_open_port "$lport" "$resolved_ip" "$dport"
+    info "转发规则添加成功: ${lport} → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+    log_action "新增转发: ${lport} -> ${target_host}(${resolved_ip}):${dport}"
     info "若转发不通，请使用菜单中的【诊断/自检】排查。"
     ui_wait_return
 }
