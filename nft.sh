@@ -1706,10 +1706,11 @@ write_conf_file() {
 
     # 先写入临时文件，成功后原子替换，避免写到一半断电导致配置损坏
     local tmp_file="${CONF_FILE}.tmp.$$"
-    local rule rule_id lport dip dport quota_gb snat_ip
+    local rule rule_id lport target_host resolved_ip dip dport quota_gb snat_ip
 
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+        IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
+        dip="$target_host"
         validate_rule_id "$rule_id" || continue
         is_rule_blocked "$rule_id" && continue
         snat_ip="$(get_snat_ip_for_dest "$dip")"
@@ -1727,7 +1728,8 @@ table ip ${TABLE_NAME} {
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
+            dip="$target_host"
             validate_rule_id "$rule_id" || continue
             cat <<EOF
     counter ${rule_id}_egress {
@@ -1743,7 +1745,8 @@ EOF
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
+            dip="$target_host"
             validate_rule_id "$rule_id" || continue
             if is_rule_blocked "$rule_id"; then
                 cat <<EOF
@@ -1771,7 +1774,8 @@ EOF
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
+            dip="$target_host"
             validate_rule_id "$rule_id" || continue
             if is_rule_blocked "$rule_id"; then
                 cat <<EOF
@@ -1807,7 +1811,8 @@ EOF
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
+            dip="$target_host"
             validate_rule_id "$rule_id" || continue
             if is_rule_blocked "$rule_id"; then
                 continue
