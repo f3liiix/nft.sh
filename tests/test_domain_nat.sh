@@ -61,6 +61,14 @@ assert_file_line_contains_all() {
     fi
 }
 
+assert_contains() {
+    local haystack="$1" needle="$2" message="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        printf 'FAIL: %s\nmissing: %s\ncontent:\n%s\n' "$message" "$needle" "$haystack" >&2
+        exit 1
+    fi
+}
+
 setup_case() {
     CASE_DIR="$(mktemp -d)"
     trap 'rm -rf "${CASE_DIR}"' EXIT
@@ -251,6 +259,51 @@ test_traffic_check_restores_files_when_reload_rules_fails_after_domain_refresh()
     assert_file_equals "${old_state_content}" "${NFT_FORWARD_STATE_FILE}" "reload_rules failure should restore pre-check traffic state"
 )
 
+test_traffic_check_syncs_firewall_when_domain_ip_changes() (
+    setup_case
+    local firewall_calls=""
+
+    seed_domain_rule_fixture 1710000000
+
+    read_counter_bytes() {
+        printf '10\n'
+    }
+    resolve_target_ipv4() {
+        printf '198.51.100.8\n'
+    }
+    reload_rules() {
+        return 0
+    }
+    firewall_open_port() {
+        firewall_calls+="open:$1:$2:$3"$'\n'
+    }
+    firewall_close_port() {
+        fail "domain refresh should not remove the local listener firewall rule"
+    }
+    firewall_close_forward_target() {
+        firewall_calls+="close-forward:$1:$2:$3"$'\n'
+    }
+
+    traffic_check 1710000000
+
+    assert_eq "${TEST_NEW_RULE}" "${RULES[0]}" "traffic_check should keep refreshed in-memory RULES after successful reload"
+    assert_contains "${firewall_calls}" "open:10000:198.51.100.8:443" "domain refresh should open firewall for new resolved IPv4"
+    assert_contains "${firewall_calls}" "close-forward:10000:93.184.216.34:443" "domain refresh should remove old target-only firewall forwarding"
+)
+
+test_migrate_new_format_conf_preserves_rule_id_when_rules_file_missing() (
+    setup_case
+    local rule_id="pf_10000_443_1710000000000000000"
+
+    RULES=("${rule_id}|10000|example.com|93.184.216.34|443|0|domain rule")
+    write_conf_file
+    rm -f "${NFT_FORWARD_RULES_FILE}"
+
+    migrate_legacy_rules_if_needed
+
+    assert_file_contains "${NFT_FORWARD_RULES_FILE}" "${rule_id}|10000|93.184.216.34|93.184.216.34|443|0|" "migration from generated conf should preserve timestamp rule_id"
+)
+
 test_install_traffic_timer_writes_expected_units() (
     setup_case
     install_traffic_timer
@@ -335,6 +388,8 @@ main() {
     test_traffic_check_rolls_back_to_pre_load_rules_disk_state
     test_traffic_check_restores_files_when_save_traffic_state_fails_after_domain_refresh
     test_traffic_check_restores_files_when_reload_rules_fails_after_domain_refresh
+    test_traffic_check_syncs_firewall_when_domain_ip_changes
+    test_migrate_new_format_conf_preserves_rule_id_when_rules_file_missing
     test_install_traffic_timer_writes_expected_units
     test_timer_unit_needs_install_detects_service_execstart_drift
     test_timer_unit_needs_install_detects_missing_service_file

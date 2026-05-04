@@ -1021,6 +1021,40 @@ firewall_close_port() {
     fi
 }
 
+# 只移除目标侧 FORWARD/route 放行，保留本机监听端口放行。
+firewall_close_forward_target() {
+    local lport="$1" dest_ip="$2" dport="$3"
+
+    if [[ ! "$lport" =~ ^[0-9]+$ ]] || ! validate_ip "$dest_ip" || ! validate_port "$dport"; then
+        return 0
+    fi
+
+    if dest_still_used "$dest_ip" "$dport" "$lport"; then
+        return 0
+    fi
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewalld_forward_rule_remove "$dest_ip" "$dport"
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log_action "firewalld 移除旧转发目标 ${dest_ip}:${dport}"
+        return
+    fi
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        log_action "UFW 移除旧转发目标 ${dest_ip}:${dport}"
+        return
+    fi
+
+    if has_iptables; then
+        iptables -D FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        try_persist_iptables || true
+        log_action "iptables 移除旧转发目标 ${dest_ip}:${dport}"
+    fi
+}
+
 # ============== 端口占用检测（TCP + UDP） ==============
 check_port_conflict() {
     local port="$1"
@@ -1570,6 +1604,41 @@ rule_fields_from_id() {
     printf '%s|%s|%s\n' "$lport" "$dip" "$dport"
 }
 
+rule_ports_from_timestamp_id() {
+    local rule_id="$1"
+    local lport dport
+    [[ "$rule_id" =~ ^pf_([0-9]+)_([0-9]+)_[0-9]{10,}$ ]] || return 1
+    lport="${BASH_REMATCH[1]}"
+    dport="${BASH_REMATCH[2]}"
+    validate_port "$lport" && validate_port "$dport" || return 1
+    printf '%s|%s\n' "$lport" "$dport"
+}
+
+rule_fields_from_generated_conf() {
+    local rule_id="$1"
+    local parsed lport dport line conf_lport dip conf_dport
+
+    if parsed="$(rule_fields_from_id "$rule_id")"; then
+        printf '%s\n' "$parsed"
+        return 0
+    fi
+
+    parsed="$(rule_ports_from_timestamp_id "$rule_id")" || return 1
+    IFS='|' read -r lport dport <<< "$parsed"
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        parsed="$(parse_dnat_rule_line "$line")" || continue
+        IFS='|' read -r conf_lport dip conf_dport <<< "$parsed"
+        if [[ "$conf_lport" == "$lport" && "$conf_dport" == "$dport" ]]; then
+            printf '%s|%s|%s\n' "$lport" "$dip" "$dport"
+            return 0
+        fi
+    done < "${CONF_FILE}"
+
+    return 1
+}
+
 migrate_legacy_rules_if_needed() {
     if [[ -f "${RULES_FILE}" ]] || [[ ! -f "${CONF_FILE}" ]]; then
         return 0
@@ -1581,7 +1650,7 @@ migrate_legacy_rules_if_needed() {
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         if parsed="$(parse_generated_counter_rule_line "$line")"; then
             rule_id="$parsed"
-            parsed="$(rule_fields_from_id "$rule_id")" || continue
+            parsed="$(rule_fields_from_generated_conf "$rule_id")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
             migrated+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|0|")
         fi
@@ -1666,6 +1735,10 @@ metadata_matches_legacy_conf_rules() {
 
 parse_dnat_rule_line() {
     local line="$1"
+    if [[ "$line" =~ ^[[:space:]]*fib[[:space:]]+daddr[[:space:]]+type[[:space:]]+local[[:space:]]+(tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+(ct[[:space:]]+mark[[:space:]]+set[[:space:]]+[0-9]+[[:space:]]+)?dnat[[:space:]]+to[[:space:]]+([0-9.]+):([0-9]+)[[:space:]]*$ ]]; then
+        printf '%s|%s|%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}"
+        return 0
+    fi
     if [[ "$line" =~ ^[[:space:]]*tcp[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+(ct[[:space:]]+mark[[:space:]]+set[[:space:]]+[0-9]+[[:space:]]+)?dnat[[:space:]]+to[[:space:]]+([0-9.]+):([0-9]+)[[:space:]]*$ ]]; then
         printf '%s|%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
         return 0
@@ -3051,9 +3124,11 @@ main_menu() {
 }
 
 DOMAIN_RESOLUTION_CHANGED=0
+DOMAIN_RESOLUTION_FIREWALL_UPDATES=()
 
 refresh_rule_resolved_ips() {
     DOMAIN_RESOLUTION_CHANGED=0
+    DOMAIN_RESOLUTION_FIREWALL_UPDATES=()
     local idx rule rule_id lport target_host resolved_ip dport quota_gb remark new_ip
     local -a refreshed_rules=()
 
@@ -3079,6 +3154,7 @@ refresh_rule_resolved_ips() {
 
         if [[ "$new_ip" != "$resolved_ip" ]]; then
             DOMAIN_RESOLUTION_CHANGED=1
+            DOMAIN_RESOLUTION_FIREWALL_UPDATES+=("${lport}|${resolved_ip}|${new_ip}|${dport}")
             refreshed_rules+=("${rule_id}|${lport}|${target_host}|${new_ip}|${dport}|${quota_gb}|${remark}")
             log_action "域名解析更新: ${target_host} ${resolved_ip} -> ${new_ip}"
         else
@@ -3088,6 +3164,15 @@ refresh_rule_resolved_ips() {
 
     RULES=("${refreshed_rules[@]}")
     return 0
+}
+
+sync_domain_resolution_firewall_updates() {
+    local update lport old_ip new_ip dport
+    for update in "${DOMAIN_RESOLUTION_FIREWALL_UPDATES[@]-}"; do
+        IFS='|' read -r lport old_ip new_ip dport <<< "$update"
+        firewall_open_port "$lport" "$new_ip" "$dport"
+        firewall_close_forward_target "$lport" "$old_ip" "$dport"
+    done
 }
 
 traffic_check() {
@@ -3219,6 +3304,7 @@ traffic_check() {
             reload_rules >/dev/null 2>&1 || true
             return 1
         fi
+        sync_domain_resolution_firewall_updates
     fi
 
     return 0
