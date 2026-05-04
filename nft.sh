@@ -554,9 +554,52 @@ format_remark() {
     fi
 }
 
+validate_domain_name() {
+    local domain="${1:-}" label
+    [[ -n "$domain" ]] || return 1
+    [[ "$domain" != *"|"* ]] || return 1
+    [[ "$domain" != *$'\t'* ]] || return 1
+    [[ "$domain" != *$'\n'* ]] || return 1
+    [[ "$domain" != *$'\r'* ]] || return 1
+    (( ${#domain} <= 253 )) || return 1
+    [[ "$domain" == *"." ]] && domain="${domain%.}"
+    [[ -n "$domain" ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$domain" =~ ^[0-9.]+$ ]] && return 1
+
+    local IFS='.'
+    read -ra labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ -n "$label" ]] || return 1
+        (( ${#label} <= 63 )) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    return 0
+}
+
+validate_target_host() {
+    local target="${1:-}"
+    validate_ip "$target" || validate_domain_name "$target"
+}
+
+rule_target_is_domain() {
+    local target="${1:-}"
+    validate_ip "$target" && return 1
+    validate_domain_name "$target"
+}
+
 format_table_target() {
     local ip="$1" port="$2"
     printf '%s:%s\n' "$ip" "$port"
+}
+
+format_rule_target() {
+    local target_host="$1" resolved_ip="$2" port="$3"
+    if [[ "$target_host" == "$resolved_ip" ]]; then
+        format_table_target "$resolved_ip" "$port"
+    else
+        printf '%s(%s):%s\n' "$target_host" "$resolved_ip" "$port"
+    fi
 }
 
 format_bytes() {
@@ -698,6 +741,17 @@ select_quota_gb() {
 }
 
 make_rule_id() {
+    local lport="$1" _target_host="$2" dport="$3"
+    local stamp
+    stamp="$(date +%s%N 2>/dev/null || date +%s)"
+    stamp="${stamp//[^0-9]/}"
+    if [[ -z "$stamp" ]]; then
+        stamp="$(date +%s)"
+    fi
+    printf 'pf_%s_%s_%s\n' "$lport" "$dport" "$stamp"
+}
+
+make_legacy_rule_id() {
     local lport="$1" dip="$2" dport="$3"
     local safe_ip="${dip//./_}"
     echo "pf_${lport}_${safe_ip}_${dport}"
@@ -1126,7 +1180,7 @@ ensure_traffic_timer_installed() {
 }
 
 # ============== 写出配置文件（基于当前 RULES 数组） ==============
-# RULES 数组格式: "rule_id|本机端口|目标IP|目标端口|quota_gb|备注"
+# RULES 数组格式: "rule_id|本机端口|target_host|resolved_ip|目标端口|quota_gb|备注"
 declare -a RULES=()
 declare -a STATE_PERIOD_START=()
 declare -a STATE_USED_BYTES=()
@@ -1150,32 +1204,78 @@ is_nonnegative_integer() {
 }
 
 validate_rule_id() {
-    [[ "${1:-}" =~ ^pf_[0-9]+_([0-9]{1,3}_){3}[0-9]{1,3}_[0-9]+$ ]]
+    local rule_id="${1:-}"
+    [[ "$rule_id" =~ ^pf_[0-9]+_([0-9]{1,3}_){3}[0-9]{1,3}_[0-9]+$ ]] && return 0
+    [[ "$rule_id" =~ ^pf_[0-9]+_[0-9]+_[0-9]{10,}$ ]] && return 0
+    return 1
 }
 
 parse_rule_metadata_line() {
     local line="$1"
-    local separators="${line//[^|]/}"
-    local rule_id lport dip dport quota_gb remark
+    local -a fields
+    local rule_id lport target_host resolved_ip dport quota_gb remark
 
-    (( ${#separators} == 4 || ${#separators} == 5 )) || return 1
-    IFS='|' read -r rule_id lport dip dport quota_gb remark <<< "$line"
-    remark="${remark:-}"
+    IFS='|' read -r -a fields <<< "$line"
+
+    case "${#fields[@]}" in
+        5)
+            rule_id="${fields[0]}"
+            lport="${fields[1]}"
+            target_host="${fields[2]}"
+            resolved_ip="${fields[2]}"
+            dport="${fields[3]}"
+            quota_gb="${fields[4]}"
+            remark=""
+            ;;
+        6)
+            rule_id="${fields[0]}"
+            lport="${fields[1]}"
+            if validate_target_host "${fields[2]}" && \
+               validate_ip "${fields[3]}" && \
+               validate_port "${fields[4]}" && \
+               validate_quota_gb "${fields[5]}"; then
+                target_host="${fields[2]}"
+                resolved_ip="${fields[3]}"
+                dport="${fields[4]}"
+                quota_gb="${fields[5]}"
+                remark=""
+            else
+                target_host="${fields[2]}"
+                resolved_ip="${fields[2]}"
+                dport="${fields[3]}"
+                quota_gb="${fields[4]}"
+                remark="${fields[5]}"
+            fi
+            ;;
+        7)
+            rule_id="${fields[0]}"
+            lport="${fields[1]}"
+            target_host="${fields[2]}"
+            resolved_ip="${fields[3]}"
+            dport="${fields[4]}"
+            quota_gb="${fields[5]}"
+            remark="${fields[6]}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 
     validate_rule_id "$rule_id" || return 1
     validate_port "$lport" || return 1
-    validate_ip "$dip" || return 1
+    validate_target_host "$target_host" || return 1
+    validate_ip "$resolved_ip" || return 1
     validate_port "$dport" || return 1
     validate_quota_gb "${quota_gb:-}" || return 1
-    validate_stored_remark "$remark" || return 1
+    validate_stored_remark "${remark:-}" || return 1
 
-    printf '%s|%s|%s|%s|%s|%s\n' "$rule_id" "$lport" "$dip" "$dport" "$quota_gb" "$remark"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$rule_id" "$lport" "$target_host" "$resolved_ip" "$dport" "$quota_gb" "${remark:-}"
 }
 
 track_state_rule_id() {
     local rule_id="$1"
     local existing
-    for existing in "${STATE_TRACKED_RULE_IDS[@]}"; do
+    for existing in "${STATE_TRACKED_RULE_IDS[@]-}"; do
         [[ "$existing" == "$rule_id" ]] && return 0
     done
     STATE_TRACKED_RULE_IDS+=("$rule_id")
@@ -1189,7 +1289,7 @@ reset_state_maps() {
         STATE_LAST_COUNTER=()
         STATE_BLOCKED=()
     else
-        for rule_id in "${STATE_TRACKED_RULE_IDS[@]}"; do
+        for rule_id in "${STATE_TRACKED_RULE_IDS[@]-}"; do
             unset "STATE_PERIOD_START__${rule_id}" \
                   "STATE_USED_BYTES__${rule_id}" \
                   "STATE_LAST_COUNTER__${rule_id}" \
@@ -1437,7 +1537,7 @@ migrate_legacy_rules_if_needed() {
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             parsed="$(parse_dnat_rule_line "$line")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
-            rule_id="$(make_rule_id "$lport" "$dip" "$dport")"
+            rule_id="$(make_legacy_rule_id "$lport" "$dip" "$dport")"
             migrated+=("${rule_id}|${lport}|${dip}|${dport}|0|")
         done < "${CONF_FILE}"
     fi
@@ -1483,7 +1583,7 @@ metadata_matches_legacy_conf_rules() {
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             parsed="$(parse_dnat_rule_line "$line")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
-            legacy_rules+=("$(make_rule_id "$lport" "$dip" "$dport")|${lport}|${dip}|${dport}")
+            legacy_rules+=("$(make_legacy_rule_id "$lport" "$dip" "$dport")|${lport}|${dip}|${dport}")
         done < "${CONF_FILE}"
     fi
 
