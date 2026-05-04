@@ -268,13 +268,13 @@ ui_table() {
 }
 
 ui_rule_choice() {
-    local prompt="$1" item idx=1 rule lport dip dport choice
+    local prompt="$1" item idx=1 rule lport target_host resolved_ip dport choice
     if gum_enabled; then
         local options=()
         options+=("0|取消")
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
-            options+=("${idx}|${idx}. ${lport} (tcp+udp) -> ${dip}:${dport}")
+            IFS='|' read -r _ lport target_host resolved_ip dport _ _ <<< "$rule"
+            options+=("${idx}|${idx}. ${lport} (tcp+udp) -> $(format_rule_target "$target_host" "$resolved_ip" "$dport")")
             ((idx++))
         done
         ui_choose "$prompt" "${options[@]}"
@@ -848,13 +848,13 @@ try_persist_iptables() {
 # 参数: $1=目标IP  $2=目标端口  $3=要排除的本机端口(即正在删除的那条)
 dest_still_used() {
     local check_ip="$1" check_dport="$2" exclude_lport="$3"
-    local rule lport dip dport
+    local rule lport resolved_ip dport
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
+        IFS='|' read -r _ lport _ resolved_ip dport _ _ <<< "$rule"
         # 跳过正在删除的那条
         [[ "$lport" == "$exclude_lport" ]] && continue
         # 如果其他规则也指向同一 dest_ip:dport，返回 true
-        if [[ "$dip" == "$check_ip" && "$dport" == "$check_dport" ]]; then
+        if [[ "$resolved_ip" == "$check_ip" && "$dport" == "$check_dport" ]]; then
             return 0
         fi
     done
@@ -1372,7 +1372,7 @@ sync_egress_counter_baselines_after_nft_reload() {
     load_traffic_state || return 0
     local rule rule_id cur last_v changed=0
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         cur="$(read_counter_bytes "${rule_id}_egress")" || continue
         last_v="$(state_get STATE_LAST_COUNTER "$rule_id" 0)"
@@ -1390,7 +1390,7 @@ sync_egress_counter_baselines_after_nft_reload() {
 ensure_state_for_rules() {
     local rule rule_id
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         # period_start=0 表示尚未开始真实采样；Task 7 接入 counter 后会在首次采样时写入。
         state_exists STATE_PERIOD_START "$rule_id" || state_set STATE_PERIOD_START "$rule_id" 0
@@ -1444,7 +1444,7 @@ save_traffic_state() {
         echo "# format: rule_id|period_start|used_bytes|last_counter|blocked"
         local rule rule_id
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+            IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
             validate_rule_id "$rule_id" || continue
             printf '%s|%s|%s|%s|%s\n' \
                 "$rule_id" \
@@ -1480,7 +1480,7 @@ rollover_expired_periods() {
 
     local rule rule_id period_start
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         period_start="$(state_get STATE_PERIOD_START "$rule_id" 0)"
         if (( period_start > 0 )) && (( now - period_start >= QUOTA_PERIOD_SECONDS )); then
@@ -2179,11 +2179,11 @@ do_diagnose() {
     if [[ ${#RULES[@]} -gt 0 ]]; then
         connectivity_prompted=true
         if ui_confirm_no_default "是否测试目标连通性？"; then
-            local rule lport dip dport
+            local rule lport target_host resolved_ip dport
             for rule in "${RULES[@]}"; do
-                IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
-                printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
-                if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
+                IFS='|' read -r _ lport target_host resolved_ip dport _ _ <<< "$rule"
+                printf "  测试 %s (TCP) ... " "$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+                if timeout 3 bash -c ">/dev/tcp/${resolved_ip}/${dport}" 2>/dev/null; then
                     printf "\033[32m通\033[0m\n"
                 else
                     printf "\033[31m不通或超时\033[0m\n"
@@ -2654,7 +2654,7 @@ do_add() {
     # 检查端口是否已有转发规则
     local rule rp
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r _ rp _ _ _ _ <<< "$rule"
+        IFS='|' read -r _ rp _ _ _ _ _ <<< "$rule"
         if [[ "$rp" == "$lport" ]]; then
             err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
             return
@@ -2921,10 +2921,10 @@ do_clear_all() {
     fi
 
     # nft 规则更新成功后，再清理外部防火墙状态，避免写入失败时产生半应用状态
-    local rule lport dip dport
+    local rule lport resolved_ip dport
     for rule in "${old_rules[@]}"; do
-        IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
+        IFS='|' read -r _ lport _ resolved_ip dport _ _ <<< "$rule"
+        firewall_close_port "$lport" "$resolved_ip" "$dport" "force"
     done
     info "所有转发规则已清空。"
     log_action "清空所有转发规则"
@@ -3011,7 +3011,7 @@ traffic_check() {
     fi
 
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ quota_gb _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ quota_gb _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
 
         current_counter="$(read_counter_bytes "${rule_id}_egress")" || {
