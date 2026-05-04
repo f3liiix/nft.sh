@@ -3190,7 +3190,11 @@ traffic_check() {
         changed=1
     fi
 
-    save_traffic_state || return 1
+    if ! save_traffic_state; then
+        RULES=("${OLD_RULES_SNAPSHOT[@]}")
+        restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
+        return 1
+    fi
 
     if (( changed == 1 )); then
         if ! write_rules_file; then
