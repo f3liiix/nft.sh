@@ -268,13 +268,13 @@ ui_table() {
 }
 
 ui_rule_choice() {
-    local prompt="$1" item idx=1 rule lport dip dport choice
+    local prompt="$1" item idx=1 rule lport target_host resolved_ip dport choice
     if gum_enabled; then
         local options=()
         options+=("0|取消")
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
-            options+=("${idx}|${idx}. ${lport} (tcp+udp) -> ${dip}:${dport}")
+            IFS='|' read -r _ lport target_host resolved_ip dport _ _ <<< "$rule"
+            options+=("${idx}|${idx}. ${lport} (tcp+udp) -> $(format_rule_target "$target_host" "$resolved_ip" "$dport")")
             ((idx++))
         done
         ui_choose "$prompt" "${options[@]}"
@@ -554,9 +554,52 @@ format_remark() {
     fi
 }
 
+validate_domain_name() {
+    local domain="${1:-}" label
+    [[ -n "$domain" ]] || return 1
+    [[ "$domain" != *"|"* ]] || return 1
+    [[ "$domain" != *$'\t'* ]] || return 1
+    [[ "$domain" != *$'\n'* ]] || return 1
+    [[ "$domain" != *$'\r'* ]] || return 1
+    (( ${#domain} <= 253 )) || return 1
+    [[ "$domain" == *"." ]] && domain="${domain%.}"
+    [[ -n "$domain" ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$domain" =~ ^[0-9.]+$ ]] && return 1
+
+    local IFS='.'
+    read -ra labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ -n "$label" ]] || return 1
+        (( ${#label} <= 63 )) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    return 0
+}
+
+validate_target_host() {
+    local target="${1:-}"
+    validate_ip "$target" || validate_domain_name "$target"
+}
+
+rule_target_is_domain() {
+    local target="${1:-}"
+    validate_ip "$target" && return 1
+    validate_domain_name "$target"
+}
+
 format_table_target() {
     local ip="$1" port="$2"
     printf '%s:%s\n' "$ip" "$port"
+}
+
+format_rule_target() {
+    local target_host="$1" resolved_ip="$2" port="$3"
+    if [[ "$target_host" == "$resolved_ip" ]]; then
+        format_table_target "$resolved_ip" "$port"
+    else
+        printf '%s(%s):%s\n' "$target_host" "$resolved_ip" "$port"
+    fi
 }
 
 format_bytes() {
@@ -634,12 +677,12 @@ rule_status_label() {
 
 print_rules_table_tsv() {
     local idx=1 now
-    local rule rule_id lport dip dport quota_gb remark used_bytes blocked quota_label used_label days_label status_label remark_label
+    local rule rule_id lport target_host resolved_ip dport quota_gb remark used_bytes blocked quota_label used_label days_label status_label remark_label
     now="$(now_epoch)"
 
     printf '序号\t协议\t本机端口\t目标地址\t流量限制\t已用流量\t下次重置\t状态\t备注\n'
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id lport dip dport quota_gb remark <<< "$rule"
+        IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb remark <<< "$rule"
         used_bytes="$(state_get STATE_USED_BYTES "$rule_id" 0)"
         blocked="$(state_get STATE_BLOCKED "$rule_id" 0)"
         quota_label="$(format_quota "$quota_gb")"
@@ -652,7 +695,7 @@ print_rules_table_tsv() {
         status_label="$(rule_status_label "$quota_gb" "$blocked")"
         remark_label="$(format_remark "$remark")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$idx" "tcp+udp" "$lport" "$(format_table_target "$dip" "$dport")" "$quota_label" "$used_label" "$days_label" "$status_label" "$remark_label"
+            "$idx" "tcp+udp" "$lport" "$(format_rule_target "$target_host" "$resolved_ip" "$dport")" "$quota_label" "$used_label" "$days_label" "$status_label" "$remark_label"
         ((idx++))
     done
 }
@@ -698,6 +741,17 @@ select_quota_gb() {
 }
 
 make_rule_id() {
+    local lport="$1" _target_host="$2" dport="$3"
+    local stamp
+    stamp="$(date +%s%N 2>/dev/null || date +%s)"
+    stamp="${stamp//[^0-9]/}"
+    if [[ -z "$stamp" ]]; then
+        stamp="$(date +%s)"
+    fi
+    printf 'pf_%s_%s_%s\n' "$lport" "$dport" "$stamp"
+}
+
+make_legacy_rule_id() {
     local lport="$1" dip="$2" dport="$3"
     local safe_ip="${dip//./_}"
     echo "pf_${lport}_${safe_ip}_${dport}"
@@ -747,6 +801,48 @@ get_snat_ip_for_dest() {
     get_local_ip
 }
 
+resolve_target_ipv4() {
+    local target_host="$1" candidate line
+
+    if validate_ip "$target_host"; then
+        printf '%s\n' "$target_host"
+        return 0
+    fi
+
+    validate_domain_name "$target_host" || return 1
+
+    if command -v getent >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            candidate="${line%%[[:space:]]*}"
+            if validate_ip "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(getent ahostsv4 "$target_host" 2>/dev/null || true)
+    fi
+
+    if command -v dig >/dev/null 2>&1; then
+        while IFS= read -r candidate; do
+            if validate_ip "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(dig +short A "$target_host" 2>/dev/null || true)
+    fi
+
+    if command -v host >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            candidate="${line##* has address }"
+            if [[ "$candidate" != "$line" ]] && validate_ip "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done < <(host "$target_host" 2>/dev/null || true)
+    fi
+
+    return 1
+}
+
 # ============== 发行版检测 ==============
 detect_pkg_manager() {
     if command -v apt-get &>/dev/null; then
@@ -794,13 +890,13 @@ try_persist_iptables() {
 # 参数: $1=目标IP  $2=目标端口  $3=要排除的本机端口(即正在删除的那条)
 dest_still_used() {
     local check_ip="$1" check_dport="$2" exclude_lport="$3"
-    local rule lport dip dport
+    local rule lport resolved_ip dport
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
+        IFS='|' read -r _ lport _ resolved_ip dport _ _ <<< "$rule"
         # 跳过正在删除的那条
         [[ "$lport" == "$exclude_lport" ]] && continue
         # 如果其他规则也指向同一 dest_ip:dport，返回 true
-        if [[ "$dip" == "$check_ip" && "$dport" == "$check_dport" ]]; then
+        if [[ "$resolved_ip" == "$check_ip" && "$dport" == "$check_dport" ]]; then
             return 0
         fi
     done
@@ -925,6 +1021,40 @@ firewall_close_port() {
     fi
 }
 
+# 只移除目标侧 FORWARD/route 放行，保留本机监听端口放行。
+firewall_close_forward_target() {
+    local lport="$1" dest_ip="$2" dport="$3"
+
+    if [[ ! "$lport" =~ ^[0-9]+$ ]] || ! validate_ip "$dest_ip" || ! validate_port "$dport"; then
+        return 0
+    fi
+
+    if dest_still_used "$dest_ip" "$dport" "$lport"; then
+        return 0
+    fi
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewalld_forward_rule_remove "$dest_ip" "$dport"
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log_action "firewalld 移除旧转发目标 ${dest_ip}:${dport}"
+        return
+    fi
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        log_action "UFW 移除旧转发目标 ${dest_ip}:${dport}"
+        return
+    fi
+
+    if has_iptables; then
+        iptables -D FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        try_persist_iptables || true
+        log_action "iptables 移除旧转发目标 ${dest_ip}:${dport}"
+    fi
+}
+
 # ============== 端口占用检测（TCP + UDP） ==============
 check_port_conflict() {
     local port="$1"
@@ -1035,12 +1165,12 @@ EOF
 
     if ! cat > "${tmp_timer}" <<EOF
 [Unit]
-Description=Run nft-forward traffic quota check every 5 minutes
+Description=Run nft-forward traffic and domain refresh check every 2 minutes
 
 [Timer]
 Unit=${service_unit}
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=2min
 AccuracySec=30s
 Persistent=true
 
@@ -1078,7 +1208,20 @@ EOF
 }
 
 timer_unit_needs_install() {
+    local expected_execstart
+
     if [[ ! -f "${TRAFFIC_SERVICE_FILE}" || ! -f "${TRAFFIC_TIMER_FILE}" ]]; then
+        return 0
+    fi
+
+    expected_execstart="ExecStart=${SCRIPT_PATH} --traffic-check"
+    if ! grep -qF "${expected_execstart}" "${TRAFFIC_SERVICE_FILE}" 2>/dev/null; then
+        return 0
+    fi
+    if ! grep -qF "OnUnitActiveSec=2min" "${TRAFFIC_TIMER_FILE}" 2>/dev/null; then
+        return 0
+    fi
+    if ! grep -qF "traffic and domain refresh check every 2 minutes" "${TRAFFIC_TIMER_FILE}" 2>/dev/null; then
         return 0
     fi
     if ! has_systemctl; then
@@ -1126,7 +1269,7 @@ ensure_traffic_timer_installed() {
 }
 
 # ============== 写出配置文件（基于当前 RULES 数组） ==============
-# RULES 数组格式: "rule_id|本机端口|目标IP|目标端口|quota_gb|备注"
+# RULES 数组格式: "rule_id|本机端口|target_host|resolved_ip|目标端口|quota_gb|备注"
 declare -a RULES=()
 declare -a STATE_PERIOD_START=()
 declare -a STATE_USED_BYTES=()
@@ -1150,32 +1293,78 @@ is_nonnegative_integer() {
 }
 
 validate_rule_id() {
-    [[ "${1:-}" =~ ^pf_[0-9]+_([0-9]{1,3}_){3}[0-9]{1,3}_[0-9]+$ ]]
+    local rule_id="${1:-}"
+    [[ "$rule_id" =~ ^pf_[0-9]+_([0-9]{1,3}_){3}[0-9]{1,3}_[0-9]+$ ]] && return 0
+    [[ "$rule_id" =~ ^pf_[0-9]+_[0-9]+_[0-9]{10,}$ ]] && return 0
+    return 1
 }
 
 parse_rule_metadata_line() {
     local line="$1"
-    local separators="${line//[^|]/}"
-    local rule_id lport dip dport quota_gb remark
+    local -a fields
+    local rule_id lport target_host resolved_ip dport quota_gb remark
 
-    (( ${#separators} == 4 || ${#separators} == 5 )) || return 1
-    IFS='|' read -r rule_id lport dip dport quota_gb remark <<< "$line"
-    remark="${remark:-}"
+    IFS='|' read -r -a fields <<< "$line"
+
+    case "${#fields[@]}" in
+        5)
+            rule_id="${fields[0]}"
+            lport="${fields[1]}"
+            target_host="${fields[2]}"
+            resolved_ip="${fields[2]}"
+            dport="${fields[3]}"
+            quota_gb="${fields[4]}"
+            remark=""
+            ;;
+        6)
+            rule_id="${fields[0]}"
+            lport="${fields[1]}"
+            if validate_target_host "${fields[2]}" && \
+               validate_ip "${fields[3]}" && \
+               validate_port "${fields[4]}" && \
+               validate_quota_gb "${fields[5]}"; then
+                target_host="${fields[2]}"
+                resolved_ip="${fields[3]}"
+                dport="${fields[4]}"
+                quota_gb="${fields[5]}"
+                remark=""
+            else
+                target_host="${fields[2]}"
+                resolved_ip="${fields[2]}"
+                dport="${fields[3]}"
+                quota_gb="${fields[4]}"
+                remark="${fields[5]}"
+            fi
+            ;;
+        7)
+            rule_id="${fields[0]}"
+            lport="${fields[1]}"
+            target_host="${fields[2]}"
+            resolved_ip="${fields[3]}"
+            dport="${fields[4]}"
+            quota_gb="${fields[5]}"
+            remark="${fields[6]}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 
     validate_rule_id "$rule_id" || return 1
     validate_port "$lport" || return 1
-    validate_ip "$dip" || return 1
+    validate_target_host "$target_host" || return 1
+    validate_ip "$resolved_ip" || return 1
     validate_port "$dport" || return 1
     validate_quota_gb "${quota_gb:-}" || return 1
-    validate_stored_remark "$remark" || return 1
+    validate_stored_remark "${remark:-}" || return 1
 
-    printf '%s|%s|%s|%s|%s|%s\n' "$rule_id" "$lport" "$dip" "$dport" "$quota_gb" "$remark"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$rule_id" "$lport" "$target_host" "$resolved_ip" "$dport" "$quota_gb" "${remark:-}"
 }
 
 track_state_rule_id() {
     local rule_id="$1"
     local existing
-    for existing in "${STATE_TRACKED_RULE_IDS[@]}"; do
+    for existing in "${STATE_TRACKED_RULE_IDS[@]-}"; do
         [[ "$existing" == "$rule_id" ]] && return 0
     done
     STATE_TRACKED_RULE_IDS+=("$rule_id")
@@ -1189,7 +1378,7 @@ reset_state_maps() {
         STATE_LAST_COUNTER=()
         STATE_BLOCKED=()
     else
-        for rule_id in "${STATE_TRACKED_RULE_IDS[@]}"; do
+        for rule_id in "${STATE_TRACKED_RULE_IDS[@]-}"; do
             unset "STATE_PERIOD_START__${rule_id}" \
                   "STATE_USED_BYTES__${rule_id}" \
                   "STATE_LAST_COUNTER__${rule_id}" \
@@ -1272,7 +1461,7 @@ sync_egress_counter_baselines_after_nft_reload() {
     load_traffic_state || return 0
     local rule rule_id cur last_v changed=0
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         cur="$(read_counter_bytes "${rule_id}_egress")" || continue
         last_v="$(state_get STATE_LAST_COUNTER "$rule_id" 0)"
@@ -1290,7 +1479,7 @@ sync_egress_counter_baselines_after_nft_reload() {
 ensure_state_for_rules() {
     local rule rule_id
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         # period_start=0 表示尚未开始真实采样；Task 7 接入 counter 后会在首次采样时写入。
         state_exists STATE_PERIOD_START "$rule_id" || state_set STATE_PERIOD_START "$rule_id" 0
@@ -1344,7 +1533,7 @@ save_traffic_state() {
         echo "# format: rule_id|period_start|used_bytes|last_counter|blocked"
         local rule rule_id
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+            IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
             validate_rule_id "$rule_id" || continue
             printf '%s|%s|%s|%s|%s\n' \
                 "$rule_id" \
@@ -1380,7 +1569,7 @@ rollover_expired_periods() {
 
     local rule rule_id period_start
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ _ _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ _ _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         period_start="$(state_get STATE_PERIOD_START "$rule_id" 0)"
         if (( period_start > 0 )) && (( now - period_start >= QUOTA_PERIOD_SECONDS )); then
@@ -1415,6 +1604,41 @@ rule_fields_from_id() {
     printf '%s|%s|%s\n' "$lport" "$dip" "$dport"
 }
 
+rule_ports_from_timestamp_id() {
+    local rule_id="$1"
+    local lport dport
+    [[ "$rule_id" =~ ^pf_([0-9]+)_([0-9]+)_[0-9]{10,}$ ]] || return 1
+    lport="${BASH_REMATCH[1]}"
+    dport="${BASH_REMATCH[2]}"
+    validate_port "$lport" && validate_port "$dport" || return 1
+    printf '%s|%s\n' "$lport" "$dport"
+}
+
+rule_fields_from_generated_conf() {
+    local rule_id="$1"
+    local parsed lport dport line conf_lport dip conf_dport
+
+    if parsed="$(rule_fields_from_id "$rule_id")"; then
+        printf '%s\n' "$parsed"
+        return 0
+    fi
+
+    parsed="$(rule_ports_from_timestamp_id "$rule_id")" || return 1
+    IFS='|' read -r lport dport <<< "$parsed"
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        parsed="$(parse_dnat_rule_line "$line")" || continue
+        IFS='|' read -r conf_lport dip conf_dport <<< "$parsed"
+        if [[ "$conf_lport" == "$lport" && "$conf_dport" == "$dport" ]]; then
+            printf '%s|%s|%s\n' "$lport" "$dip" "$dport"
+            return 0
+        fi
+    done < "${CONF_FILE}"
+
+    return 1
+}
+
 migrate_legacy_rules_if_needed() {
     if [[ -f "${RULES_FILE}" ]] || [[ ! -f "${CONF_FILE}" ]]; then
         return 0
@@ -1426,9 +1650,9 @@ migrate_legacy_rules_if_needed() {
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         if parsed="$(parse_generated_counter_rule_line "$line")"; then
             rule_id="$parsed"
-            parsed="$(rule_fields_from_id "$rule_id")" || continue
+            parsed="$(rule_fields_from_generated_conf "$rule_id")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
-            migrated+=("${rule_id}|${lport}|${dip}|${dport}|0|")
+            migrated+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|0|")
         fi
     done < "${CONF_FILE}"
 
@@ -1437,8 +1661,8 @@ migrate_legacy_rules_if_needed() {
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             parsed="$(parse_dnat_rule_line "$line")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
-            rule_id="$(make_rule_id "$lport" "$dip" "$dport")"
-            migrated+=("${rule_id}|${lport}|${dip}|${dport}|0|")
+            rule_id="$(make_legacy_rule_id "$lport" "$dip" "$dport")"
+            migrated+=("${rule_id}|${lport}|${dip}|${dip}|${dport}|0|")
         done < "${CONF_FILE}"
     fi
 
@@ -1470,7 +1694,7 @@ metadata_matches_legacy_conf_rules() {
     local -a legacy_rules=()
     local -a generated_rule_ids=()
     local -a metadata_rules=()
-    local line parsed lport dip dport rule_id quota_gb remark derived_lport derived_dip derived_dport
+    local line parsed lport target_host resolved_ip dport rule_id quota_gb remark dip
 
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -1483,7 +1707,7 @@ metadata_matches_legacy_conf_rules() {
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             parsed="$(parse_dnat_rule_line "$line")" || continue
             IFS='|' read -r lport dip dport <<< "$parsed"
-            legacy_rules+=("$(make_rule_id "$lport" "$dip" "$dport")|${lport}|${dip}|${dport}")
+            legacy_rules+=("$(make_legacy_rule_id "$lport" "$dip" "$dport")|${lport}|${dip}|${dport}")
         done < "${CONF_FILE}"
     fi
 
@@ -1491,14 +1715,11 @@ metadata_matches_legacy_conf_rules() {
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         parsed="$(parse_rule_metadata_line "$line")" || return 1
-        IFS='|' read -r rule_id lport dip dport quota_gb remark <<< "$parsed"
-        parsed="$(rule_fields_from_id "$rule_id")" || return 1
-        IFS='|' read -r derived_lport derived_dip derived_dport <<< "$parsed"
-        [[ "$derived_lport" == "$lport" && "$derived_dip" == "$dip" && "$derived_dport" == "$dport" ]] || return 1
+        IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb remark <<< "$parsed"
         if [[ ${#generated_rule_ids[@]} -gt 0 ]]; then
             metadata_rules+=("${rule_id}")
         else
-            metadata_rules+=("${rule_id}|${lport}|${dip}|${dport}")
+            metadata_rules+=("$(make_legacy_rule_id "$lport" "$resolved_ip" "$dport")|${lport}|${resolved_ip}|${dport}")
         fi
     done < "${RULES_FILE}"
 
@@ -1514,6 +1735,10 @@ metadata_matches_legacy_conf_rules() {
 
 parse_dnat_rule_line() {
     local line="$1"
+    if [[ "$line" =~ ^[[:space:]]*fib[[:space:]]+daddr[[:space:]]+type[[:space:]]+local[[:space:]]+(tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+(ct[[:space:]]+mark[[:space:]]+set[[:space:]]+[0-9]+[[:space:]]+)?dnat[[:space:]]+to[[:space:]]+([0-9.]+):([0-9]+)[[:space:]]*$ ]]; then
+        printf '%s|%s|%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}"
+        return 0
+    fi
     if [[ "$line" =~ ^[[:space:]]*tcp[[:space:]]+dport[[:space:]]+([0-9]+)[[:space:]]+(ct[[:space:]]+mark[[:space:]]+set[[:space:]]+[0-9]+[[:space:]]+)?dnat[[:space:]]+to[[:space:]]+([0-9.]+):([0-9]+)[[:space:]]*$ ]]; then
         printf '%s|%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
         return 0
@@ -1586,7 +1811,7 @@ write_rules_file() {
     local tmp_file="${RULES_FILE}.tmp.$$"
     {
         echo "# nft-forward rules metadata"
-        echo "# format: rule_id|local_port|dest_ip|dest_port|quota_gb|remark"
+        echo "# format: rule_id|local_port|target_host|resolved_ip|dest_port|quota_gb|remark"
         local rule parsed
         for rule in "${RULES[@]}"; do
             parsed="$(parse_rule_metadata_line "$rule")" || continue
@@ -1609,15 +1834,15 @@ write_conf_file() {
 
     # 先写入临时文件，成功后原子替换，避免写到一半断电导致配置损坏
     local tmp_file="${CONF_FILE}.tmp.$$"
-    local rule rule_id lport dip dport quota_gb snat_ip
+    local rule rule_id lport target_host resolved_ip dport quota_gb snat_ip target_label
 
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+        IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
         is_rule_blocked "$rule_id" && continue
-        snat_ip="$(get_snat_ip_for_dest "$dip")"
+        snat_ip="$(get_snat_ip_for_dest "$resolved_ip")"
         if [[ -z "$snat_ip" ]]; then
-            err "无法获取到 ${dip} 的 SNAT 源地址，请检查路由配置。"
+            err "无法获取到 ${resolved_ip} 的 SNAT 源地址，请检查路由配置。"
             return 1
         fi
     done
@@ -1630,7 +1855,7 @@ table ip ${TABLE_NAME} {
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
             validate_rule_id "$rule_id" || continue
             cat <<EOF
     counter ${rule_id}_egress {
@@ -1646,21 +1871,22 @@ EOF
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
             validate_rule_id "$rule_id" || continue
+            target_label="$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
             if is_rule_blocked "$rule_id"; then
                 cat <<EOF
 
-        # 阻断: 本机:${lport} -> ${dip}:${dport}
+        # 阻断: 本机:${lport} -> ${target_label}
         fib daddr type local tcp dport ${lport} drop
         fib daddr type local udp dport ${lport} drop
 EOF
             else
                 cat <<EOF
 
-        # 转发: 本机:${lport} -> ${dip}:${dport}
-        fib daddr type local tcp dport ${lport} ct mark set ${lport} dnat to ${dip}:${dport}
-        fib daddr type local udp dport ${lport} ct mark set ${lport} dnat to ${dip}:${dport}
+        # 转发: 本机:${lport} -> ${target_label}
+        fib daddr type local tcp dport ${lport} ct mark set ${lport} dnat to ${resolved_ip}:${dport}
+        fib daddr type local udp dport ${lport} ct mark set ${lport} dnat to ${resolved_ip}:${dport}
 EOF
             fi
         done
@@ -1674,29 +1900,30 @@ EOF
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
             validate_rule_id "$rule_id" || continue
+            target_label="$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
             if is_rule_blocked "$rule_id"; then
                 cat <<EOF
 
-        # 阻断请求: 客户端 -> ${dip}:${dport}
-        ct mark ${lport} ip daddr ${dip} tcp dport ${dport} drop
-        ct mark ${lport} ip daddr ${dip} udp dport ${dport} drop
+        # 阻断请求: 客户端 -> ${target_label}
+        ct mark ${lport} ip daddr ${resolved_ip} tcp dport ${dport} drop
+        ct mark ${lport} ip daddr ${resolved_ip} udp dport ${dport} drop
 
-        # 阻断回程: ${dip}:${dport} -> 客户端
-        ct mark ${lport} ip saddr ${dip} tcp sport ${dport} drop
-        ct mark ${lport} ip saddr ${dip} udp sport ${dport} drop
+        # 阻断回程: ${target_label} -> 客户端
+        ct mark ${lport} ip saddr ${resolved_ip} tcp sport ${dport} drop
+        ct mark ${lport} ip saddr ${resolved_ip} udp sport ${dport} drop
 EOF
             else
                 cat <<EOF
 
-        # 放行请求: 客户端 -> ${dip}:${dport}
-        ct mark ${lport} ip daddr ${dip} tcp dport ${dport} accept
-        ct mark ${lport} ip daddr ${dip} udp dport ${dport} accept
+        # 放行请求: 客户端 -> ${target_label}
+        ct mark ${lport} ip daddr ${resolved_ip} tcp dport ${dport} accept
+        ct mark ${lport} ip daddr ${resolved_ip} udp dport ${dport} accept
 
-        # 统计回程: ${dip}:${dport} -> 客户端
-        ct mark ${lport} ip saddr ${dip} tcp sport ${dport} counter name ${rule_id}_egress accept
-        ct mark ${lport} ip saddr ${dip} udp sport ${dport} counter name ${rule_id}_egress accept
+        # 统计回程: ${target_label} -> 客户端
+        ct mark ${lport} ip saddr ${resolved_ip} tcp sport ${dport} counter name ${rule_id}_egress accept
+        ct mark ${lport} ip saddr ${resolved_ip} udp sport ${dport} counter name ${rule_id}_egress accept
 EOF
             fi
         done
@@ -1710,17 +1937,18 @@ EOF
 EOF
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$rule"
             validate_rule_id "$rule_id" || continue
             if is_rule_blocked "$rule_id"; then
                 continue
             fi
-            snat_ip="$(get_snat_ip_for_dest "$dip")"
+            target_label="$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+            snat_ip="$(get_snat_ip_for_dest "$resolved_ip")"
             cat <<EOF
 
-        # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为到目标路由的源地址
-        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to ${snat_ip}
-        ip daddr ${dip} udp dport ${dport} ct status dnat snat to ${snat_ip}
+        # 回源: 发往 ${target_label} 的已 DNAT 流量, SNAT 为到目标路由的源地址
+        ip daddr ${resolved_ip} tcp dport ${dport} ct status dnat snat to ${snat_ip}
+        ip daddr ${resolved_ip} udp dport ${dport} ct status dnat snat to ${snat_ip}
 EOF
         done
 
@@ -2077,11 +2305,11 @@ do_diagnose() {
     if [[ ${#RULES[@]} -gt 0 ]]; then
         connectivity_prompted=true
         if ui_confirm_no_default "是否测试目标连通性？"; then
-            local rule lport dip dport
+            local rule lport target_host resolved_ip dport
             for rule in "${RULES[@]}"; do
-                IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
-                printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
-                if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
+                IFS='|' read -r _ lport target_host resolved_ip dport _ _ <<< "$rule"
+                printf "  测试 %s (TCP) ... " "$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+                if timeout 3 bash -c ">/dev/tcp/${resolved_ip}/${dport}" 2>/dev/null; then
                     printf "\033[32m通\033[0m\n"
                 else
                     printf "\033[31m不通或超时\033[0m\n"
@@ -2214,7 +2442,7 @@ do_install() {
 # ====================================================
 edit_rule_quota_and_remark_at() {
     local row_idx="$1"
-    local target rule_id lport dip dport old_q old_rm new_q new_rm
+    local target rule_id lport target_host resolved_ip dport old_q old_rm new_q new_rm
     local -a OLD_SNAPSHOT
 
     if ! command -v nft &>/dev/null; then
@@ -2230,9 +2458,9 @@ edit_rule_quota_and_remark_at() {
     fi
 
     target="${RULES[$((row_idx - 1))]}"
-    IFS='|' read -r rule_id lport dip dport old_q old_rm <<< "$target"
+    IFS='|' read -r rule_id lport target_host resolved_ip dport old_q old_rm <<< "$target"
 
-    printf '当前所选规则：本机 %s (tcp+udp) → %s:%s\n' "$lport" "$dip" "$dport"
+    printf '当前所选规则：本机 %s (tcp+udp) → %s\n' "$lport" "$(format_rule_target "$target_host" "$resolved_ip" "$dport")"
     printf '%s\n' '仅月流量上限与备注可修改（如需修改目标地址，请先删除再新增）。'
     printf '月流量上限: %s\n' "$(format_quota "$old_q")"
     printf '备注: %s\n' "$(format_remark "$old_rm")"
@@ -2277,7 +2505,7 @@ edit_rule_quota_and_remark_at() {
         echo ""
     fi
     echo "即将保存修改为:"
-    echo " - 本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo " - 本机端口 ${lport} (tcp+udp) → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
     echo " - 月流量上限: $(format_quota "$old_q") → $(format_quota "$new_q")"
     echo " - 备注: $(format_remark "$old_rm") → $(format_remark "$new_rm")"
     echo ""
@@ -2287,7 +2515,7 @@ edit_rule_quota_and_remark_at() {
     fi
 
     OLD_SNAPSHOT=("${RULES[@]}")
-    RULES[$((row_idx - 1))]="${rule_id}|${lport}|${dip}|${dport}|${new_q}|${new_rm}"
+    RULES[$((row_idx - 1))]="${rule_id}|${lport}|${target_host}|${resolved_ip}|${dport}|${new_q}|${new_rm}"
 
     backup_conf
     if ! write_rules_file; then
@@ -2305,7 +2533,7 @@ edit_rule_quota_and_remark_at() {
     fi
 
     info "保存成功。"
-    log_action "编辑规则(限额/备注): ${lport} -> ${dip}:${dport}; quota_gb ${old_q} -> ${new_q}"
+    log_action "编辑规则(限额/备注): ${lport} -> ${resolved_ip}:${dport}; quota_gb ${old_q} -> ${new_q}"
     return 0
 }
 
@@ -2335,7 +2563,7 @@ do_list() {
     local idx=1
     local now
     now="$(now_epoch)"
-    local rule rule_id lport dip dport quota_gb remark used_bytes blocked quota_label used_label days_label status_label remark_label selected_row choice
+    local rule rule_id lport target_host resolved_ip dport quota_gb remark used_bytes blocked quota_label used_label days_label status_label remark_label selected_row choice
 
     if gum_enabled; then
         if [[ "$wait_return" != "1" ]]; then
@@ -2377,7 +2605,7 @@ do_list() {
         echo "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r rule_id lport dip dport quota_gb remark <<< "$rule"
+            IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb remark <<< "$rule"
             used_bytes="$(state_get STATE_USED_BYTES "$rule_id" 0)"
             blocked="$(state_get STATE_BLOCKED "$rule_id" 0)"
             quota_label="$(format_quota "$quota_gb")"
@@ -2390,7 +2618,7 @@ do_list() {
             status_label="$(rule_status_label "$quota_gb" "$blocked")"
             remark_label="$(format_remark "$remark")"
             printf "%-6s %-10s %-10s %-22s %-10s %-10s %-11s %-10s %-20s\n" \
-                "$idx" "tcp+udp" "$lport" "$(format_table_target "$dip" "$dport")" "$quota_label" "$used_label" "$days_label" "$status_label" "$remark_label"
+                "$idx" "tcp+udp" "$lport" "$(format_rule_target "$target_host" "$resolved_ip" "$dport")" "$quota_label" "$used_label" "$days_label" "$status_label" "$remark_label"
             ((idx++))
         done
         echo ""
@@ -2460,13 +2688,13 @@ reset_rule_traffic_interactive() {
         return
     fi
 
-    local target rule_id lport dip dport quota_gb used_bytes
+    local target rule_id lport target_host resolved_ip dport quota_gb used_bytes
     target="${RULES[$((choice-1))]}"
-    IFS='|' read -r rule_id lport dip dport quota_gb _ <<< "$target"
+    IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb _ <<< "$target"
     used_bytes="$(state_get STATE_USED_BYTES "$rule_id" 0)"
 
     echo "即将重置流量并恢复转发:"
-    echo " - 本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo " - 本机端口 ${lport} (tcp+udp) → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
     echo " - 已用流量: $(format_bytes "$used_bytes")"
     echo ""
     if ! ui_confirm_yes_default "确认重置？"; then
@@ -2507,8 +2735,8 @@ reset_rule_traffic_interactive() {
         return 1
     fi
 
-    info "已重置规则流量用量并恢复转发: ${lport} → ${dip}:${dport}"
-    log_action "重置流量状态并恢复转发: ${lport} -> ${dip}:${dport}"
+    info "已重置规则流量用量并恢复转发: ${lport} → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+    log_action "重置流量状态并恢复转发: ${lport} -> ${resolved_ip}:${dport}"
     ui_wait_return
 }
 
@@ -2552,7 +2780,7 @@ do_add() {
     # 检查端口是否已有转发规则
     local rule rp
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r _ rp _ _ _ _ <<< "$rule"
+        IFS='|' read -r _ rp _ _ _ _ _ <<< "$rule"
         if [[ "$rp" == "$lport" ]]; then
             err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
             return
@@ -2565,17 +2793,21 @@ do_add() {
         return
     fi
 
-    # 输入目标 IP
-    local dip
+    # 输入目标地址并解析 IPv4
+    local target_host resolved_ip
     while true; do
-        if ! dip="$(ui_input "请输入目标 IP 地址:" "" "例如 192.168.1.100")"; then
+        if ! target_host="$(ui_input "请输入目标 IP 或域名:" "" "例如 192.168.1.100 或 example.com")"; then
             info "已取消。"
             return
         fi
-        if validate_ip "$dip"; then
+        if ! validate_target_host "$target_host"; then
+            err "目标地址无效，请输入合法 IPv4 或域名。"
+            continue
+        fi
+        if resolved_ip="$(resolve_target_ipv4 "$target_host")"; then
             break
         fi
-        err "IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
+        err "无法解析 ${target_host} 的 IPv4 地址，请检查域名或 DNS。"
     done
 
     # 输入目标端口
@@ -2618,7 +2850,10 @@ do_add() {
         echo ""
     fi
     echo "即将添加转发规则:"
-    echo " - 本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo " - 本机端口 ${lport} (tcp+udp) -> ${target_host}:${dport}"
+    if [[ "$target_host" != "$resolved_ip" ]]; then
+        echo " - 当前解析 IP: ${resolved_ip}"
+    fi
     echo " - 月流量上限: $(format_quota "$quota_gb")"
     echo " - 备注: $(format_remark "$remark")"
     echo ""
@@ -2631,8 +2866,8 @@ do_add() {
     backup_conf
     local -a OLD_RULES_SNAPSHOT=("${RULES[@]}")
     local rule_id
-    rule_id="$(make_rule_id "$lport" "$dip" "$dport")"
-    RULES+=("${rule_id}|${lport}|${dip}|${dport}|${quota_gb}|${remark}")
+    rule_id="$(make_rule_id "$lport" "$target_host" "$dport")"
+    RULES+=("${rule_id}|${lport}|${target_host}|${resolved_ip}|${dport}|${quota_gb}|${remark}")
     if ! write_rules_file; then
         RULES=("${OLD_RULES_SNAPSHOT[@]}")
         return
@@ -2648,9 +2883,9 @@ do_add() {
         return
     fi
 
-    firewall_open_port "$lport" "$dip" "$dport"
-    info "转发规则添加成功: ${lport} → ${dip}:${dport}"
-    log_action "新增转发: ${lport} -> ${dip}:${dport}"
+    firewall_open_port "$lport" "$resolved_ip" "$dport"
+    info "转发规则添加成功: ${lport} → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+    log_action "新增转发: ${lport} -> ${target_host}(${resolved_ip}):${dport}"
     info "若转发不通，请使用菜单中的【诊断/自检】排查。"
     ui_wait_return
 }
@@ -2677,7 +2912,7 @@ do_delete() {
 
     printf '\n'
     local idx=1
-    local rule lport dip dport remark remark_label
+    local rule lport target_host resolved_ip dport remark remark_label
     local choice selected_row
     if gum_enabled; then
         load_traffic_state
@@ -2697,10 +2932,10 @@ do_delete() {
         echo "─────────────────────────────────────────────────────────────────────────"
 
         for rule in "${RULES[@]}"; do
-            IFS='|' read -r _ lport dip dport _ remark <<< "$rule"
+            IFS='|' read -r _ lport target_host resolved_ip dport _ remark <<< "$rule"
             remark_label="$(format_remark "$remark")"
             printf "%-6s %-10s %-10s -> %-20s %-20s\n" \
-                "$idx" "tcp+udp" "$lport" "$(format_table_target "$dip" "$dport")" "$remark_label"
+                "$idx" "tcp+udp" "$lport" "$(format_rule_target "$target_host" "$resolved_ip" "$dport")" "$remark_label"
             ((idx++))
         done
         # 选择删除
@@ -2721,10 +2956,10 @@ do_delete() {
     fi
 
     local target="${RULES[$((choice-1))]}"
-    IFS='|' read -r _ lport dip dport _ remark <<< "$target"
+    IFS='|' read -r _ lport target_host resolved_ip dport _ remark <<< "$target"
 
     echo "即将删除转发规则:"
-    echo " - 本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo " - 本机端口 ${lport} (tcp+udp) → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
     echo " - 备注: ${remark}"
     echo ""
     if ! ui_confirm_yes_default "确认删除？"; then
@@ -2760,9 +2995,9 @@ do_delete() {
     fi
 
     # nft 规则已成功更新后，再清理防火墙放行（RULES 已移除该条，dest_still_used 能正确判断）
-    firewall_close_port "$lport" "$dip" "$dport"
-    info "转发规则已删除: ${lport} → ${dip}:${dport}"
-    log_action "删除转发: ${lport} -> ${dip}:${dport}"
+    firewall_close_port "$lport" "$resolved_ip" "$dport"
+    info "转发规则已删除: ${lport} → $(format_rule_target "$target_host" "$resolved_ip" "$dport")"
+    log_action "删除转发: ${lport} -> ${resolved_ip}:${dport}"
     ui_wait_return
 }
 
@@ -2819,10 +3054,10 @@ do_clear_all() {
     fi
 
     # nft 规则更新成功后，再清理外部防火墙状态，避免写入失败时产生半应用状态
-    local rule lport dip dport
+    local rule lport resolved_ip dport
     for rule in "${old_rules[@]}"; do
-        IFS='|' read -r _ lport dip dport _ _ <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
+        IFS='|' read -r _ lport _ resolved_ip dport _ _ <<< "$rule"
+        firewall_close_port "$lport" "$resolved_ip" "$dport" "force"
     done
     info "所有转发规则已清空。"
     log_action "清空所有转发规则"
@@ -2888,16 +3123,65 @@ main_menu() {
     done
 }
 
+DOMAIN_RESOLUTION_CHANGED=0
+DOMAIN_RESOLUTION_FIREWALL_UPDATES=()
+
+refresh_rule_resolved_ips() {
+    DOMAIN_RESOLUTION_CHANGED=0
+    DOMAIN_RESOLUTION_FIREWALL_UPDATES=()
+    local idx rule rule_id lport target_host resolved_ip dport quota_gb remark new_ip
+    local -a refreshed_rules=()
+
+    for idx in "${!RULES[@]}"; do
+        rule="${RULES[$idx]}"
+        IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb remark <<< "$rule"
+
+        if ! validate_rule_id "$rule_id" || ! validate_target_host "$target_host" || ! validate_ip "$resolved_ip"; then
+            refreshed_rules+=("$rule")
+            continue
+        fi
+
+        if ! rule_target_is_domain "$target_host"; then
+            refreshed_rules+=("$rule")
+            continue
+        fi
+
+        if ! new_ip="$(resolve_target_ipv4 "$target_host")"; then
+            warn "域名 ${target_host} 解析失败，保留上一次 IPv4: ${resolved_ip}"
+            refreshed_rules+=("$rule")
+            continue
+        fi
+
+        if [[ "$new_ip" != "$resolved_ip" ]]; then
+            DOMAIN_RESOLUTION_CHANGED=1
+            DOMAIN_RESOLUTION_FIREWALL_UPDATES+=("${lport}|${resolved_ip}|${new_ip}|${dport}")
+            refreshed_rules+=("${rule_id}|${lport}|${target_host}|${new_ip}|${dport}|${quota_gb}|${remark}")
+            log_action "域名解析更新: ${target_host} ${resolved_ip} -> ${new_ip}"
+        else
+            refreshed_rules+=("$rule")
+        fi
+    done
+
+    RULES=("${refreshed_rules[@]}")
+    return 0
+}
+
+sync_domain_resolution_firewall_updates() {
+    local update lport old_ip new_ip dport
+    for update in "${DOMAIN_RESOLUTION_FIREWALL_UPDATES[@]-}"; do
+        IFS='|' read -r lport old_ip new_ip dport <<< "$update"
+        firewall_open_port "$lport" "$new_ip" "$dport"
+        firewall_close_forward_target "$lport" "$old_ip" "$dport"
+    done
+}
+
 traffic_check() {
     local now="${1:-$(now_epoch)}"
     local changed=0 counter_repaired=0
     local rule rule_id quota_gb
     local current_counter period_start used_bytes last_counter blocked delta quota_limit
-    local old_state_content="" old_conf_content="" had_state=0 had_conf=0
-
-    load_rules
-    ensure_state_for_rules
-    load_traffic_state
+    local old_state_content="" old_conf_content="" old_rules_content="" had_state=0 had_conf=0 had_rules=0
+    local -a OLD_RULES_SNAPSHOT=()
 
     if [[ -f "${STATE_FILE}" ]]; then
         old_state_content="$(cat "${STATE_FILE}")"
@@ -2907,20 +3191,31 @@ traffic_check() {
         old_conf_content="$(cat "${CONF_FILE}")"
         had_conf=1
     fi
+    if [[ -f "${RULES_FILE}" ]]; then
+        old_rules_content="$(cat "${RULES_FILE}")"
+        had_rules=1
+    fi
+
+    load_rules
+    OLD_RULES_SNAPSHOT=("${RULES[@]}")
+    ensure_state_for_rules
+    load_traffic_state
 
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rule_id _ _ _ quota_gb _ <<< "$rule"
+        IFS='|' read -r rule_id _ _ _ _ quota_gb _ <<< "$rule"
         validate_rule_id "$rule_id" || continue
 
         current_counter="$(read_counter_bytes "${rule_id}_egress")" || {
             if (( counter_repaired == 0 )); then
                 counter_repaired=1
                 if ! write_conf_file; then
-                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+                    RULES=("${OLD_RULES_SNAPSHOT[@]}")
+                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
                     return 1
                 fi
                 if ! reload_rules; then
-                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+                    RULES=("${OLD_RULES_SNAPSHOT[@]}")
+                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
                     return 1
                 fi
                 warn "检测到流量计数器缺失，已重载 nftables 转发规则。"
@@ -2981,25 +3276,42 @@ traffic_check() {
         state_set STATE_BLOCKED "$rule_id" "$blocked"
     done
 
-    save_traffic_state || return 1
+    refresh_rule_resolved_ips || true
+    if (( DOMAIN_RESOLUTION_CHANGED == 1 )); then
+        changed=1
+    fi
+
+    if ! save_traffic_state; then
+        RULES=("${OLD_RULES_SNAPSHOT[@]}")
+        restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
+        return 1
+    fi
 
     if (( changed == 1 )); then
+        if ! write_rules_file; then
+            RULES=("${OLD_RULES_SNAPSHOT[@]}")
+            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
+            return 1
+        fi
         if ! write_conf_file; then
-            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+            RULES=("${OLD_RULES_SNAPSHOT[@]}")
+            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
             return 1
         fi
         if ! reload_rules; then
-            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+            RULES=("${OLD_RULES_SNAPSHOT[@]}")
+            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
             reload_rules >/dev/null 2>&1 || true
             return 1
         fi
+        sync_domain_resolution_firewall_updates
     fi
 
     return 0
 }
 
 restore_traffic_check_files() {
-    local had_state="$1" old_state_content="$2" had_conf="$3" old_conf_content="$4"
+    local had_state="$1" old_state_content="$2" had_conf="$3" old_conf_content="$4" had_rules="${5:-0}" old_rules_content="${6:-}"
     local tmp_file
 
     if [[ "$had_state" == "1" ]]; then
@@ -3042,6 +3354,28 @@ restore_traffic_check_files() {
     else
         if ! rm -f "${CONF_FILE}" 2>/dev/null; then
             err "无法删除配置文件 ${CONF_FILE}"
+            return 1
+        fi
+    fi
+
+    if [[ "$had_rules" == "1" ]]; then
+        mkdir -p "$(dirname "${RULES_FILE}")" 2>/dev/null || {
+            err "无法创建规则目录 $(dirname "${RULES_FILE}")"
+            return 1
+        }
+        if [[ -d "${RULES_FILE}" ]]; then
+            err "无法恢复规则文件 ${RULES_FILE}"
+            return 1
+        fi
+        tmp_file="${RULES_FILE}.restore.$$"
+        if ! printf '%s\n' "$old_rules_content" > "${tmp_file}" 2>/dev/null || ! mv -f "${tmp_file}" "${RULES_FILE}" 2>/dev/null; then
+            rm -f "${tmp_file}" 2>/dev/null || true
+            err "无法恢复规则文件 ${RULES_FILE}"
+            return 1
+        fi
+    else
+        if ! rm -f "${RULES_FILE}" 2>/dev/null; then
+            err "无法删除规则文件 ${RULES_FILE}"
             return 1
         fi
     fi
