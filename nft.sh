@@ -1131,12 +1131,12 @@ EOF
 
     if ! cat > "${tmp_timer}" <<EOF
 [Unit]
-Description=Run nft-forward traffic quota check every 5 minutes
+Description=Run nft-forward traffic and domain refresh check every 2 minutes
 
 [Timer]
 Unit=${service_unit}
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=2min
 AccuracySec=30s
 Persistent=true
 
@@ -1175,6 +1175,12 @@ EOF
 
 timer_unit_needs_install() {
     if [[ ! -f "${TRAFFIC_SERVICE_FILE}" || ! -f "${TRAFFIC_TIMER_FILE}" ]]; then
+        return 0
+    fi
+    if ! grep -qF "OnUnitActiveSec=2min" "${TRAFFIC_TIMER_FILE}" 2>/dev/null; then
+        return 0
+    fi
+    if ! grep -qF "traffic and domain refresh check every 2 minutes" "${TRAFFIC_TIMER_FILE}" 2>/dev/null; then
         return 0
     fi
     if ! has_systemctl; then
@@ -3037,14 +3043,57 @@ main_menu() {
     done
 }
 
+DOMAIN_RESOLUTION_CHANGED=0
+
+refresh_rule_resolved_ips() {
+    DOMAIN_RESOLUTION_CHANGED=0
+    local idx rule rule_id lport target_host resolved_ip dport quota_gb remark new_ip
+    local -a refreshed_rules=()
+
+    for idx in "${!RULES[@]}"; do
+        rule="${RULES[$idx]}"
+        IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb remark <<< "$rule"
+
+        if ! validate_rule_id "$rule_id" || ! validate_target_host "$target_host" || ! validate_ip "$resolved_ip"; then
+            refreshed_rules+=("$rule")
+            continue
+        fi
+
+        if ! rule_target_is_domain "$target_host"; then
+            refreshed_rules+=("$rule")
+            continue
+        fi
+
+        if ! new_ip="$(resolve_target_ipv4 "$target_host")"; then
+            warn "域名 ${target_host} 解析失败，保留上一次 IPv4: ${resolved_ip}"
+            refreshed_rules+=("$rule")
+            continue
+        fi
+
+        if [[ "$new_ip" != "$resolved_ip" ]]; then
+            DOMAIN_RESOLUTION_CHANGED=1
+            refreshed_rules+=("${rule_id}|${lport}|${target_host}|${new_ip}|${dport}|${quota_gb}|${remark}")
+            firewall_open_port "$lport" "$new_ip" "$dport"
+            log_action "域名解析更新: ${target_host} ${resolved_ip} -> ${new_ip}"
+        else
+            refreshed_rules+=("$rule")
+        fi
+    done
+
+    RULES=("${refreshed_rules[@]}")
+    return 0
+}
+
 traffic_check() {
     local now="${1:-$(now_epoch)}"
     local changed=0 counter_repaired=0
     local rule rule_id quota_gb
     local current_counter period_start used_bytes last_counter blocked delta quota_limit
-    local old_state_content="" old_conf_content="" had_state=0 had_conf=0
+    local old_state_content="" old_conf_content="" old_rules_content="" had_state=0 had_conf=0 had_rules=0
+    local -a OLD_RULES_SNAPSHOT=()
 
     load_rules
+    OLD_RULES_SNAPSHOT=("${RULES[@]}")
     ensure_state_for_rules
     load_traffic_state
 
@@ -3056,6 +3105,10 @@ traffic_check() {
         old_conf_content="$(cat "${CONF_FILE}")"
         had_conf=1
     fi
+    if [[ -f "${RULES_FILE}" ]]; then
+        old_rules_content="$(cat "${RULES_FILE}")"
+        had_rules=1
+    fi
 
     for rule in "${RULES[@]}"; do
         IFS='|' read -r rule_id _ _ _ _ quota_gb _ <<< "$rule"
@@ -3065,11 +3118,13 @@ traffic_check() {
             if (( counter_repaired == 0 )); then
                 counter_repaired=1
                 if ! write_conf_file; then
-                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+                    RULES=("${OLD_RULES_SNAPSHOT[@]}")
+                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
                     return 1
                 fi
                 if ! reload_rules; then
-                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+                    RULES=("${OLD_RULES_SNAPSHOT[@]}")
+                    restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
                     return 1
                 fi
                 warn "检测到流量计数器缺失，已重载 nftables 转发规则。"
@@ -3130,15 +3185,27 @@ traffic_check() {
         state_set STATE_BLOCKED "$rule_id" "$blocked"
     done
 
+    refresh_rule_resolved_ips || true
+    if (( DOMAIN_RESOLUTION_CHANGED == 1 )); then
+        changed=1
+    fi
+
     save_traffic_state || return 1
 
     if (( changed == 1 )); then
+        if ! write_rules_file; then
+            RULES=("${OLD_RULES_SNAPSHOT[@]}")
+            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
+            return 1
+        fi
         if ! write_conf_file; then
-            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+            RULES=("${OLD_RULES_SNAPSHOT[@]}")
+            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
             return 1
         fi
         if ! reload_rules; then
-            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" || return 1
+            RULES=("${OLD_RULES_SNAPSHOT[@]}")
+            restore_traffic_check_files "$had_state" "$old_state_content" "$had_conf" "$old_conf_content" "$had_rules" "$old_rules_content" || return 1
             reload_rules >/dev/null 2>&1 || true
             return 1
         fi
@@ -3148,7 +3215,7 @@ traffic_check() {
 }
 
 restore_traffic_check_files() {
-    local had_state="$1" old_state_content="$2" had_conf="$3" old_conf_content="$4"
+    local had_state="$1" old_state_content="$2" had_conf="$3" old_conf_content="$4" had_rules="${5:-0}" old_rules_content="${6:-}"
     local tmp_file
 
     if [[ "$had_state" == "1" ]]; then
@@ -3191,6 +3258,28 @@ restore_traffic_check_files() {
     else
         if ! rm -f "${CONF_FILE}" 2>/dev/null; then
             err "无法删除配置文件 ${CONF_FILE}"
+            return 1
+        fi
+    fi
+
+    if [[ "$had_rules" == "1" ]]; then
+        mkdir -p "$(dirname "${RULES_FILE}")" 2>/dev/null || {
+            err "无法创建规则目录 $(dirname "${RULES_FILE}")"
+            return 1
+        }
+        if [[ -d "${RULES_FILE}" ]]; then
+            err "无法恢复规则文件 ${RULES_FILE}"
+            return 1
+        fi
+        tmp_file="${RULES_FILE}.restore.$$"
+        if ! printf '%s\n' "$old_rules_content" > "${tmp_file}" 2>/dev/null || ! mv -f "${tmp_file}" "${RULES_FILE}" 2>/dev/null; then
+            rm -f "${tmp_file}" 2>/dev/null || true
+            err "无法恢复规则文件 ${RULES_FILE}"
+            return 1
+        fi
+    else
+        if ! rm -f "${RULES_FILE}" 2>/dev/null; then
+            err "无法删除规则文件 ${RULES_FILE}"
             return 1
         fi
     fi
