@@ -36,8 +36,7 @@
 ## 用法
 
 ```bash
-sudo bash nft.sh              # 交互式主菜单（默认）
-sudo bash nft.sh --traffic-check   # 流量配额检查（供 systemd timer 调用，勿手动频繁执行）
+sudo bash nft.sh
 ```
 
 无参数启动时会尝试确保 gum 可用（可按环境变量配置下载镜像）、初始化配置目录，并尽量安装/启用 **流量检查 systemd timer**。
