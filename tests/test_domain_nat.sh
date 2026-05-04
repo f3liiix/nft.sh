@@ -45,6 +45,13 @@ assert_file_absent() {
     fi
 }
 
+assert_file_equals() {
+    local expected="$1" file="$2" message="$3"
+    local actual
+    actual="$(cat "$file")"
+    assert_eq "$expected" "$actual" "$message"
+}
+
 assert_file_line_contains_all() {
     local file="$1" needle1="$2" needle2="$3" message="$4"
     if ! awk -v needle1="$needle1" -v needle2="$needle2" 'index($0, needle1) && index($0, needle2) { found=1; exit } END { exit found ? 0 : 1 }' "$file"; then
@@ -75,6 +82,26 @@ setup_case() {
     get_snat_ip_for_dest() {
         printf '10.0.0.1\n'
     }
+}
+
+seed_domain_rule_fixture() {
+    local now="${1:-1710000000}"
+    local rule_id="pf_10000_443_1710000000000000000"
+    local old_rule="${rule_id}|10000|example.com|93.184.216.34|443|0|domain rule"
+
+    RULES=("${old_rule}")
+    ensure_state_for_rules
+    state_set STATE_PERIOD_START "${rule_id}" "${now}"
+    state_set STATE_USED_BYTES "${rule_id}" 0
+    state_set STATE_LAST_COUNTER "${rule_id}" 10
+    state_set STATE_BLOCKED "${rule_id}" 0
+    save_traffic_state
+    write_rules_file
+    write_conf_file
+
+    TEST_RULE_ID="${rule_id}"
+    TEST_OLD_RULE="${old_rule}"
+    TEST_NEW_RULE="${rule_id}|10000|example.com|198.51.100.8|443|0|domain rule"
 }
 
 test_target_validation() (
@@ -166,10 +193,137 @@ test_traffic_check_rolls_back_to_pre_load_rules_disk_state() (
     assert_file_absent "${NFT_FORWARD_STATE_FILE}" "rollback should delete migrated state file when it did not exist before load_rules"
 )
 
-test_timer_uses_two_minutes() (
+test_traffic_check_restores_files_when_save_traffic_state_fails_after_domain_refresh() (
+    setup_case
+    local old_rules_content old_conf_content old_state_content
+
+    seed_domain_rule_fixture 1710000000
+    old_rules_content="$(cat "${NFT_FORWARD_RULES_FILE}")"
+    old_conf_content="$(cat "${NFT_FORWARD_CONF_FILE}")"
+    old_state_content="$(cat "${NFT_FORWARD_STATE_FILE}")"
+
+    read_counter_bytes() {
+        printf '10\n'
+    }
+    resolve_target_ipv4() {
+        printf '198.51.100.8\n'
+    }
+    save_traffic_state() {
+        return 1
+    }
+
+    if traffic_check 1710000000; then
+        fail "traffic_check should fail when save_traffic_state fails after domain refresh"
+    fi
+
+    assert_eq "${TEST_OLD_RULE}" "${RULES[0]}" "save_traffic_state failure should restore in-memory RULES to previous resolved IPv4"
+    assert_file_equals "${old_rules_content}" "${NFT_FORWARD_RULES_FILE}" "save_traffic_state failure should preserve pre-check rules metadata"
+    assert_file_equals "${old_conf_content}" "${NFT_FORWARD_CONF_FILE}" "save_traffic_state failure should preserve pre-check nft config"
+    assert_file_equals "${old_state_content}" "${NFT_FORWARD_STATE_FILE}" "save_traffic_state failure should preserve pre-check traffic state"
+)
+
+test_traffic_check_restores_files_when_reload_rules_fails_after_domain_refresh() (
+    setup_case
+    local old_rules_content old_conf_content old_state_content
+
+    seed_domain_rule_fixture 1710000000
+    old_rules_content="$(cat "${NFT_FORWARD_RULES_FILE}")"
+    old_conf_content="$(cat "${NFT_FORWARD_CONF_FILE}")"
+    old_state_content="$(cat "${NFT_FORWARD_STATE_FILE}")"
+
+    read_counter_bytes() {
+        printf '10\n'
+    }
+    resolve_target_ipv4() {
+        printf '198.51.100.8\n'
+    }
+    reload_rules() {
+        return 1
+    }
+
+    if traffic_check 1710000000; then
+        fail "traffic_check should fail when reload_rules fails after domain refresh"
+    fi
+
+    assert_eq "${TEST_OLD_RULE}" "${RULES[0]}" "reload_rules failure should restore in-memory RULES to previous resolved IPv4"
+    assert_file_equals "${old_rules_content}" "${NFT_FORWARD_RULES_FILE}" "reload_rules failure should restore pre-check rules metadata"
+    assert_file_equals "${old_conf_content}" "${NFT_FORWARD_CONF_FILE}" "reload_rules failure should restore pre-check nft config"
+    assert_file_equals "${old_state_content}" "${NFT_FORWARD_STATE_FILE}" "reload_rules failure should restore pre-check traffic state"
+)
+
+test_install_traffic_timer_writes_expected_units() (
     setup_case
     install_traffic_timer
+    assert_file_contains "${NFT_FORWARD_SYSTEMD_DIR}/nft-forward-traffic-check.service" "ExecStart=${SCRIPT} --traffic-check" "service should run the installed script path"
     assert_file_contains "${NFT_FORWARD_SYSTEMD_DIR}/nft-forward-traffic-check.timer" 'OnUnitActiveSec=2min' "timer should run every 2 minutes"
+    assert_file_contains "${NFT_FORWARD_SYSTEMD_DIR}/nft-forward-traffic-check.timer" 'traffic and domain refresh check every 2 minutes' "timer description should mention domain refresh checks"
+)
+
+test_timer_unit_needs_install_detects_service_execstart_drift() (
+    setup_case
+    local timer_name
+
+    install_traffic_timer
+    timer_name="$(basename "${TRAFFIC_TIMER_FILE}")"
+    has_systemctl() {
+        return 0
+    }
+    systemctl() {
+        if [[ "$1" == "is-enabled" && "$2" == "${timer_name}" ]]; then
+            printf 'enabled\n'
+            return 0
+        fi
+        if [[ "$1" == "is-active" && "$2" == "${timer_name}" ]]; then
+            printf 'active\n'
+            return 0
+        fi
+        return 1
+    }
+
+    if timer_unit_needs_install; then
+        fail "matching timer/service units should not require reinstall"
+    fi
+
+    cat > "${TRAFFIC_SERVICE_FILE}" <<EOF
+[Unit]
+Description=nft-forward traffic quota check
+
+[Service]
+Type=oneshot
+ExecStart=/root/nft.sh --traffic-check
+EOF
+
+    if ! timer_unit_needs_install; then
+        fail "service ExecStart drift should require reinstall"
+    fi
+)
+
+test_timer_unit_needs_install_detects_missing_service_file() (
+    setup_case
+    local timer_name
+
+    install_traffic_timer
+    timer_name="$(basename "${TRAFFIC_TIMER_FILE}")"
+    has_systemctl() {
+        return 0
+    }
+    systemctl() {
+        if [[ "$1" == "is-enabled" && "$2" == "${timer_name}" ]]; then
+            printf 'enabled\n'
+            return 0
+        fi
+        if [[ "$1" == "is-active" && "$2" == "${timer_name}" ]]; then
+            printf 'active\n'
+            return 0
+        fi
+        return 1
+    }
+
+    rm -f "${TRAFFIC_SERVICE_FILE}"
+
+    if ! timer_unit_needs_install; then
+        fail "missing service file should require reinstall even if timer file exists"
+    fi
 )
 
 main() {
@@ -179,7 +333,11 @@ main() {
     test_refresh_updates_domain_ip_and_preserves_rule_id
     test_refresh_keeps_previous_ip_on_resolution_failure
     test_traffic_check_rolls_back_to_pre_load_rules_disk_state
-    test_timer_uses_two_minutes
+    test_traffic_check_restores_files_when_save_traffic_state_fails_after_domain_refresh
+    test_traffic_check_restores_files_when_reload_rules_fails_after_domain_refresh
+    test_install_traffic_timer_writes_expected_units
+    test_timer_unit_needs_install_detects_service_execstart_drift
+    test_timer_unit_needs_install_detects_missing_service_file
     printf 'All domain NAT tests passed\n'
 }
 

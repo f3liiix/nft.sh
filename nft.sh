@@ -1174,7 +1174,14 @@ EOF
 }
 
 timer_unit_needs_install() {
+    local expected_execstart
+
     if [[ ! -f "${TRAFFIC_SERVICE_FILE}" || ! -f "${TRAFFIC_TIMER_FILE}" ]]; then
+        return 0
+    fi
+
+    expected_execstart="ExecStart=${SCRIPT_PATH} --traffic-check"
+    if ! grep -qF "${expected_execstart}" "${TRAFFIC_SERVICE_FILE}" 2>/dev/null; then
         return 0
     fi
     if ! grep -qF "OnUnitActiveSec=2min" "${TRAFFIC_TIMER_FILE}" 2>/dev/null; then
