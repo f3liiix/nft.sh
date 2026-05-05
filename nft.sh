@@ -1733,6 +1733,25 @@ legacy_conf_has_rules() {
     return 1
 }
 
+metadata_rule_id_matches_fields() {
+    local rule_id="$1" lport="$2" resolved_ip="$3" dport="$4"
+    local parsed id_lport id_ip id_dport
+
+    if parsed="$(rule_fields_from_id "$rule_id")"; then
+        IFS='|' read -r id_lport id_ip id_dport <<< "$parsed"
+        [[ "$lport" == "$id_lport" && "$resolved_ip" == "$id_ip" && "$dport" == "$id_dport" ]]
+        return
+    fi
+
+    if parsed="$(rule_ports_from_timestamp_id "$rule_id")"; then
+        IFS='|' read -r id_lport id_dport <<< "$parsed"
+        [[ "$lport" == "$id_lport" && "$dport" == "$id_dport" ]]
+        return
+    fi
+
+    return 1
+}
+
 metadata_matches_legacy_conf_rules() {
     [[ -f "${RULES_FILE}" ]] || return 1
     [[ -f "${CONF_FILE}" ]] || return 0
@@ -1762,6 +1781,7 @@ metadata_matches_legacy_conf_rules() {
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         parsed="$(parse_rule_metadata_line "$line")" || return 1
         IFS='|' read -r rule_id lport target_host resolved_ip dport quota_gb remark <<< "$parsed"
+        metadata_rule_id_matches_fields "$rule_id" "$lport" "$resolved_ip" "$dport" || return 1
         if [[ ${#generated_rule_ids[@]} -gt 0 ]]; then
             metadata_rules+=("${rule_id}")
         else
@@ -2034,17 +2054,18 @@ build_nft_reload_batch() {
 reload_rules() {
     local load_file="$CONF_FILE" batch_file=""
 
-    if ! nft -c -f "${CONF_FILE}"; then
-        err "配置校验失败，未修改当前运行中的 nftables 规则。请检查 ${CONF_FILE}"
-        return 1
-    fi
-
     if nft list table ip "${TABLE_NAME}" >/dev/null 2>&1; then
         batch_file="$(build_nft_reload_batch)" || {
             err "无法创建 nftables 重载批处理文件。"
             return 1
         }
         load_file="$batch_file"
+    fi
+
+    if ! nft -c -f "${load_file}"; then
+        rm -f "$batch_file" 2>/dev/null || true
+        err "配置校验失败，未修改当前运行中的 nftables 规则。请检查 ${CONF_FILE}"
+        return 1
     fi
 
     if ! ui_spin_shell "重载 nftables 转发规则" "nft -f \"${load_file}\""; then
@@ -2563,11 +2584,18 @@ edit_rule_quota_and_remark_at() {
     OLD_SNAPSHOT=("${RULES[@]}")
     RULES[$((row_idx - 1))]="${rule_id}|${lport}|${target_host}|${resolved_ip}|${dport}|${new_q}|${new_rm}"
 
-    backup_conf
     if ! write_rules_file; then
         RULES=("${OLD_SNAPSHOT[@]}")
         return 1
     fi
+
+    if [[ "$new_q" == "$old_q" ]]; then
+        info "保存成功。"
+        log_action "编辑规则备注: ${lport} -> ${resolved_ip}:${dport}"
+        return 0
+    fi
+
+    backup_conf
     if ! write_conf_file; then
         restore_rules_state 0 "${OLD_SNAPSHOT[@]}"
         return 1
