@@ -37,6 +37,36 @@
 
 ## 用法
 
+### 一键安装（推荐）
+
+将本仓库的 Cloudflare 分发配置部署到 `nft.hide.ss` 后，可以在服务器上直接运行：
+
+```bash
+curl -fsSL https://nft.hide.ss | sudo bash
+```
+
+这个入口会先下载正式的 `nft.sh`，通过 `bash -n` 做语法检查，并在可用时校验 `sha256.txt`，再安装到：
+
+```text
+/usr/local/sbin/nft.sh
+```
+
+安装完成后会执行该稳定路径里的脚本，因此后续 systemd timer 仍然固定运行：
+
+```text
+/usr/local/sbin/nft.sh --traffic-check
+```
+
+安装入口会在无参数交互运行时把标准输入重新接回 `/dev/tty`，避免 `curl | sudo bash` 的管道输入导致菜单读取到 EOF。
+
+如果你想测试其它分发域名或安装路径，可以用：
+
+```bash
+curl -fsSL https://example.com | sudo NFT_FORWARD_BASE_URL=https://example.com NFT_FORWARD_SCRIPT_PATH=/usr/local/sbin/nft.sh bash
+```
+
+### 本地运行
+
 ```bash
 sudo bash nft.sh
 ```
@@ -93,6 +123,7 @@ sudo bash nft.sh
 | `NFT_FORWARD_STATE_DIR` / `NFT_FORWARD_STATE_FILE` | 流量状态 |
 | `NFT_FORWARD_SYSTEMD_DIR` | systemd 单元目录 |
 | `NFT_FORWARD_SCRIPT_PATH` | 安装副本路径（timer 里 `ExecStart` 指向这里） |
+| `NFT_FORWARD_SCRIPT_URL` | `nft.sh` 自安装 fallback 下载地址（默认 `https://nft.hide.ss/nft.sh`） |
 | `NFT_FORWARD_TABLE_NAME` | nft 表名（默认 `port_forward`） |
 | `NFT_FORWARD_QUOTA_PERIOD_SECONDS` | 限额统计周期秒数（默认 2592000 ≈ 30 天） |
 | `NFT_FORWARD_GB_BYTES` | 「1GB」字节数（默认 10⁹） |
@@ -101,6 +132,46 @@ sudo bash nft.sh
 | `NFT_FORWARD_GUM_BIN` / `GUM_*` 系列 | gum 二进制名、超时、DEB 下载 URL、是否启用 Charm 仓库回退等 |
 | `NFT_FORWARD_TABLE_HEADER_FG` | gum 表格表头前景色 |
 | `NFT_FORWARD_TEST_MODE` | 非空时安装 timer 可能跳过 `systemctl enable`（用于测试） |
+
+## Cloudflare 分发部署
+
+仓库内提供最小 Cloudflare Workers Static Assets 配置：
+
+```text
+deploy/cloudflare/
+  prepare-release.sh
+  wrangler.toml
+  src/worker.js
+  public/install.sh
+  public/version
+```
+
+`public/nft.sh` 和 `public/sha256.txt` 是生成物，不提交、不手工维护。每次准备发布前运行：
+
+```bash
+deploy/cloudflare/prepare-release.sh
+```
+
+它会把仓库根目录的 `nft.sh` 同步到 `deploy/cloudflare/public/nft.sh`，并重新生成 `sha256.txt`。
+
+然后进入 Cloudflare 目录发布：
+
+```bash
+cd deploy/cloudflare
+wrangler deploy
+```
+
+Worker 的路径语义：
+
+| 路径 | 说明 |
+|------|------|
+| `/` | 返回 `install.sh`，用于 `curl -fsSL https://nft.hide.ss \| sudo bash` |
+| `/install.sh` | 安装入口脚本 |
+| `/nft.sh` | 主脚本 |
+| `/version` | 当前发布版本 |
+| `/sha256.txt` | `nft.sh` 的 SHA256 校验值 |
+
+Cloudflare 控制台中把自定义域名 `nft.hide.ss` 绑定到这个 Worker 后，用户侧只需要使用推荐的一键命令。
 
 ## 注意事项与风险
 

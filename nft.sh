@@ -19,6 +19,7 @@ SYSTEMD_DIR="${NFT_FORWARD_SYSTEMD_DIR:-/etc/systemd/system}"
 TRAFFIC_SERVICE_FILE="${NFT_FORWARD_TRAFFIC_SERVICE_FILE:-${SYSTEMD_DIR}/nft-forward-traffic-check.service}"
 TRAFFIC_TIMER_FILE="${NFT_FORWARD_TRAFFIC_TIMER_FILE:-${SYSTEMD_DIR}/nft-forward-traffic-check.timer}"
 SCRIPT_PATH="${NFT_FORWARD_SCRIPT_PATH:-/usr/local/sbin/nft.sh}"
+SCRIPT_URL="${NFT_FORWARD_SCRIPT_URL:-https://nft.hide.ss/nft.sh}"
 TABLE_NAME="${NFT_FORWARD_TABLE_NAME:-port_forward}"
 QUOTA_PERIOD_SECONDS="${NFT_FORWARD_QUOTA_PERIOD_SECONDS:-2592000}"
 GB_BYTES="${NFT_FORWARD_GB_BYTES:-1000000000}"
@@ -1237,10 +1238,45 @@ timer_unit_needs_install() {
     return 0
 }
 
+source_script_path() {
+    printf '%s\n' "${BASH_SOURCE[0]}"
+}
+
+is_regular_readable_script_source() {
+    local source_path="$1"
+    [[ -n "$source_path" && -f "$source_path" && -r "$source_path" ]]
+}
+
+download_current_script_to_temp() {
+    local tmp_script
+    tmp_script="$(mktemp /tmp/nft-forward-script.XXXXXX)" || return 1
+    if ! curl_with_timeout -fsSL -o "$tmp_script" "$SCRIPT_URL"; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        return 1
+    fi
+    if ! bash -n "$tmp_script" 2>/dev/null; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        return 1
+    fi
+    printf '%s\n' "$tmp_script"
+}
+
+install_script_source_to_script_path() {
+    local source_path="$1"
+    if install -m 0755 "$source_path" "${SCRIPT_PATH}" 2>/dev/null; then
+        info "已安装脚本到 ${SCRIPT_PATH}，用于流量限制定时检查。"
+        mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
+        log_action "安装脚本到 ${SCRIPT_PATH}"
+        return 0
+    fi
+
+    return 1
+}
+
 install_current_script_to_script_path() {
-    local source_path
-    source_path="${BASH_SOURCE[0]}"
-    if [[ -x "${SCRIPT_PATH}" ]] && cmp -s "$source_path" "${SCRIPT_PATH}" 2>/dev/null; then
+    local source_path tmp_source=""
+    source_path="$(source_script_path)"
+    if is_regular_readable_script_source "$source_path" && [[ -x "${SCRIPT_PATH}" ]] && cmp -s "$source_path" "${SCRIPT_PATH}" 2>/dev/null; then
         return 0
     fi
 
@@ -1248,11 +1284,21 @@ install_current_script_to_script_path() {
         warn "无法创建脚本安装目录 $(dirname "${SCRIPT_PATH}")，流量限制不会自动执行。"
         return 1
     }
-    if install -m 0755 "$source_path" "${SCRIPT_PATH}" 2>/dev/null; then
-        info "已安装脚本到 ${SCRIPT_PATH}，用于流量限制定时检查。"
-        mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
-        log_action "安装脚本到 ${SCRIPT_PATH}"
-        return 0
+
+    if is_regular_readable_script_source "$source_path"; then
+        if install_script_source_to_script_path "$source_path"; then
+            return 0
+        fi
+    else
+        tmp_source="$(download_current_script_to_temp)" || {
+            warn "无法从 ${SCRIPT_URL} 下载脚本，流量限制不会自动执行。"
+            return 1
+        }
+        if install_script_source_to_script_path "$tmp_source"; then
+            rm -f "$tmp_source" 2>/dev/null || true
+            return 0
+        fi
+        rm -f "$tmp_source" 2>/dev/null || true
     fi
 
     warn "无法安装脚本到 ${SCRIPT_PATH}，流量限制不会自动执行。"
